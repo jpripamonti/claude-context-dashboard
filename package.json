@@ -1,0 +1,27 @@
+{
+  "name": "claude-context-dashboard",
+  "version": "0.1.0",
+  "description": "Local dashboard showing everything Claude Code would load for a project: instructions files, settings, plugins, MCP servers, skills, and subagents.",
+  "type": "module",
+  "bin": {
+    "claude-context": "./bin/cli.js"
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "test": "node test/write-paths.test.mjs && node test/editor.test.mjs",
+    "check": "node bin/check-config.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jpripamonti/claude-context-dashboard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jpripamonti/claude-context-dashboard/issues"
+  },
+  "homepage": "https://github.com/jpripamonti/claude-context-dashboard#readme",
+  "author": "Juan Ripamonti"
+}

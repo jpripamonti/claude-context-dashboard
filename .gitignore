@@ -1,0 +1,6 @@
+node_modules/
+.agent/
+.DS_Store
+
+# Personal, per-machine project settings — kept locally, not published
+/.claude/settings.json

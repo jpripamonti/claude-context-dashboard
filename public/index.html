@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Claude context dashboard</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header id="top-bar">
+    <div id="brand">
+      <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 2 17 6v8l-7 4-7-4V6l7-4Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M10 2v8m0 8v-8m0 0L3 6m7 4 7-4" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+      <h1>Claude context dashboard</h1>
+    </div>
+    <div class="project-picker">
+      <input id="project-path" type="text" spellcheck="false" />
+      <button id="load-btn">Load</button>
+      <select id="known-projects"><option value="">Recent projects…</option></select>
+    </div>
+    <div id="generated-at" class="muted"></div>
+  </header>
+
+  <div id="layout">
+    <nav id="side-nav" aria-label="Sections"></nav>
+    <main id="content">
+      <p class="muted">Loading…</p>
+    </main>
+  </div>
+
+  <div id="editor" hidden>
+    <div class="editor-panel" role="dialog" aria-label="Edit file">
+      <div class="editor-head">
+        <span id="editor-path"></span>
+        <button id="editor-close" class="btn">Close</button>
+      </div>
+      <textarea id="editor-text" spellcheck="false" autocomplete="off"></textarea>
+      <div id="editor-history" hidden></div>
+      <div class="editor-foot">
+        <span id="editor-msg" class="muted"></span>
+        <div class="editor-foot-buttons">
+          <button id="editor-versions" class="btn" hidden>Earlier versions</button>
+          <button id="editor-save" class="btn primary">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
