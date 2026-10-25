@@ -8,7 +8,7 @@
   },
   "main": "src/server.js",
   "scripts": {
-    "test": "node test/write-paths.test.mjs && node test/editor.test.mjs",
+    "test": "node test/write-paths.test.mjs && node test/scan.test.mjs && node test/editor.test.mjs",
     "check": "node bin/check-config.js"
   },
   "engines": {
