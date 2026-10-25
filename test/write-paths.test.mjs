@@ -32,7 +32,8 @@ w(path.join(PROJECT, 'CLAUDE.md'), '# project rules\n');
 w(path.join(PROJECT, '.claude', 'settings.json'), JSON.stringify({}, null, 2));
 
 // imported after HOME is redirected above, so the modules read the fake home
-const { createServer } = await import('../src/server.js');
+const serverModule = await import('../src/server.js');
+const { startServer } = serverModule;
 const toggle = await import('../src/toggle.js');
 
 // Ask the machine for a free port first — the server needs to know its own
@@ -48,18 +49,27 @@ const PORT = await new Promise((resolve) => {
 });
 // The restart is handed to the server rather than performed by it, so this
 // suite can watch the endpoint without restarting the test run.
+// Started the way the command line starts it, so the address it listens on is
+// the one users get.
 let restartsAsked = 0;
-const server = createServer(PROJECT, PORT, { onRestart: () => { restartsAsked++; } });
-await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
+let restartHandedToken = null;
+const started = await startServer({
+  projectPath: PROJECT,
+  port: PORT,
+  onRestart: (_server, handed = {}) => { restartsAsked++; restartHandedToken = handed.token; },
+});
+const { server, token: TOKEN } = started;
 
 const BASE = `http://127.0.0.1:${PORT}`;
-const H = { 'Content-Type': 'application/json', Origin: BASE, Host: `127.0.0.1:${PORT}` };
+// every API request needs this launch's key; the checks that leave it out say so
+const T = { 'X-Dashboard-Token': TOKEN };
+const H = { 'Content-Type': 'application/json', Origin: BASE, Host: `127.0.0.1:${PORT}`, ...T };
 const post = async (p, body) => {
   const res = await fetch(BASE + p, { method: 'POST', headers: H, body: JSON.stringify(body) });
   return { status: res.status, body: await res.json() };
 };
 const get = async (p) => {
-  const res = await fetch(BASE + p, { headers: { Origin: BASE } });
+  const res = await fetch(BASE + p, { headers: { Origin: BASE, ...T } });
   return { status: res.status, body: await res.json() };
 };
 const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -1279,7 +1289,7 @@ w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
 
   const notJson = await fetch(BASE + '/api/restart', {
     method: 'POST',
-    headers: { 'Content-Type': 'text/plain', Origin: BASE },
+    headers: { 'Content-Type': 'text/plain', Origin: BASE, ...T },
     body: 'restart',
   });
   await new Promise((r) => setTimeout(r, 50));
@@ -1290,7 +1300,7 @@ w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
   // alone; a valid one under the wrong type is what tests the type check
   const validButPlain = await fetch(BASE + '/api/restart', {
     method: 'POST',
-    headers: { 'Content-Type': 'text/plain', Origin: BASE },
+    headers: { 'Content-Type': 'text/plain', Origin: BASE, ...T },
     body: '{}',
   });
   await new Promise((r) => setTimeout(r, 50));
@@ -1299,14 +1309,14 @@ w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
 
   const fromElsewhere = await fetch(BASE + '/api/restart', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example' },
+    headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example', ...T },
     body: '{}',
   });
   await new Promise((r) => setTimeout(r, 50));
   check('and neither does another page in the same browser',
     fromElsewhere.status === 403 && restartsAsked === before + 1, `${fromElsewhere.status} restarts=${restartsAsked - before}`);
 
-  const asGet = await fetch(`${BASE}/api/restart`, { headers: { Origin: BASE } });
+  const asGet = await fetch(`${BASE}/api/restart`, { headers: { Origin: BASE, ...T } });
   await new Promise((r) => setTimeout(r, 50));
   check('and neither does merely visiting the address',
     asGet.status === 404 && restartsAsked === before + 1, `${asGet.status} restarts=${restartsAsked - before}`);
@@ -1315,18 +1325,18 @@ w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
 // --- CSRF -------------------------------------------------------------
 const foreign = await fetch(BASE + '/api/file/save', {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example', Host: `127.0.0.1:${PORT}` },
+  headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example', Host: `127.0.0.1:${PORT}`, ...T },
   body: JSON.stringify({ filePath: projectMd, projectPath: PROJECT, content: 'x' }),
 });
 check('foreign origin blocked on save', foreign.status === 403, foreign.status);
 const foreignInv = await fetch(`${BASE}/api/inventory?path=${encodeURIComponent(PROJECT)}`, {
-  headers: { Origin: 'http://evil.example' },
+  headers: { Origin: 'http://evil.example', ...T },
 });
 check('foreign origin blocked on the inventory too', foreignInv.status === 403, foreignInv.status);
 // fetch() refuses to set Host, so this one needs a raw request
 const http = await import('node:http');
-const rawStatus = (headers) => new Promise((resolve, reject) => {
-  const req = http.request({ host: '127.0.0.1', port: PORT, path: '/api/inventory', headers }, (r) => {
+const rawStatus = (headers, withKey = true) => new Promise((resolve, reject) => {
+  const req = http.request({ host: '127.0.0.1', port: PORT, path: '/api/inventory', headers: withKey ? { ...T, ...headers } : headers }, (r) => {
     r.resume();
     resolve(r.statusCode);
   });
@@ -1336,6 +1346,128 @@ const rawStatus = (headers) => new Promise((resolve, reject) => {
 check('foreign host blocked', (await rawStatus({ Host: 'evil.example' })) === 403);
 check('a rebinding hostname is blocked', (await rawStatus({ Host: `attacker.test:${PORT}` })) === 403);
 check('the dashboard\'s own host is accepted', (await rawStatus({ Host: `localhost:${PORT}` })) === 200);
+
+// --- the launch key ------------------------------------------------------
+// Host and Origin only stop a browser: any program on the machine can send
+// the right ones. What it cannot send is the key this launch printed.
+{
+  check('the server listens on loopback only', server.address().address === '127.0.0.1', JSON.stringify(server.address()));
+  check('and the address it gives to open carries the key in the fragment',
+    started.url === `http://localhost:${PORT}/#token=${TOKEN}` && /^[A-Za-z0-9_-]{43}$/.test(TOKEN), started.url);
+  const local = { Host: `127.0.0.1:${PORT}` };
+  check('a request with the right Host but no key is refused',
+    (await rawStatus(local, false)) === 403);
+  const noKeyGet = await fetch(`${BASE}/api/projects`, { headers: { Origin: BASE } });
+  const noKeyBody = await noKeyGet.json();
+  check('a GET without the key is refused, saying to open the address the terminal printed',
+    noKeyGet.status === 403 && /terminal printed/.test(noKeyBody.error) && !JSON.stringify(noKeyBody).includes(TOKEN),
+    `${noKeyGet.status} ${JSON.stringify(noKeyBody)}`);
+  const readTarget = path.join(HOME, '.zshrc');
+  const noKeyRead = await fetch(`${BASE}/api/file?path=${encodeURIComponent(readTarget)}&project=${encodeURIComponent(HOME)}`, { headers: { Origin: BASE } });
+  const noKeyReadBody = await noKeyRead.text();
+  check('reading a file without the key is refused before anything is read',
+    noKeyRead.status === 403 && !noKeyReadBody.includes('ORIGINAL SHELL CONFIG'), `${noKeyRead.status} ${noKeyReadBody.slice(0, 120)}`);
+  const settingsWas = fs.readFileSync(path.join(PROJECT, '.claude', 'settings.json'), 'utf8');
+  const noKeyPost = await fetch(`${BASE}/api/toggle/plugin`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: BASE },
+    body: JSON.stringify({ projectPath: PROJECT, key: 'nokey@market', enabled: false, scope: 'project' }),
+  });
+  check('a POST without the key is refused and writes nothing',
+    noKeyPost.status === 403 && fs.readFileSync(path.join(PROJECT, '.claude', 'settings.json'), 'utf8') === settingsWas, noKeyPost.status);
+  const restartsBefore = restartsAsked;
+  const noKeyRestart = await fetch(`${BASE}/api/restart`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: BASE }, body: '{}' });
+  await new Promise((r) => setTimeout(r, 50));
+  check('and so is a restart', noKeyRestart.status === 403 && restartsAsked === restartsBefore, `${noKeyRestart.status}`);
+  // wrong keys: another launch's, one character off, a prefix, and one longer
+  const wrongKeys = [serverModule.newToken(), TOKEN.slice(0, -1) + (TOKEN.endsWith('A') ? 'B' : 'A'), TOKEN.slice(0, 10), TOKEN + 'x', TOKEN + TOKEN];
+  const wrongStatuses = [];
+  for (const k of wrongKeys) wrongStatuses.push(await rawStatus({ ...local, 'X-Dashboard-Token': k }, false));
+  check('a wrong key is refused, whatever its length', wrongStatuses.every((st) => st === 403), JSON.stringify(wrongStatuses));
+  check('the right key is accepted', (await rawStatus({ ...local, 'X-Dashboard-Token': TOKEN }, false)) === 200);
+  // the page itself has to load without the key, or there is nothing to put it in
+  const staticStatuses = [];
+  for (const p2 of ['/', '/app.js', '/index.html']) staticStatuses.push((await fetch(BASE + p2)).status);
+  check('the page\'s own files are served without the key', staticStatuses.every((st) => st === 200), JSON.stringify(staticStatuses));
+  let threw = false;
+  try { serverModule.createServer(PROJECT, PORT, {}); } catch { threw = true; }
+  check('there is no way to build a server without a key', threw);
+
+  // a restart hands the key to the replacement in its environment, never its arguments
+  const cmd = serverModule.restartCommand(TOKEN, [process.execPath, '/x/bin/cli.js', '--port', '9'], { HOME, PATH: process.env.PATH });
+  check('a restart passes the key in the environment, not on the command line',
+    cmd.options.env[serverModule.TOKEN_ENV] === TOKEN && !cmd.args.some((a) => a.includes(TOKEN)) &&
+    cmd.args.includes('--no-open') && cmd.args[0] === '/x/bin/cli.js' && cmd.options.env.HOME === HOME,
+    JSON.stringify(cmd.args));
+  const env = { [serverModule.TOKEN_ENV]: TOKEN, OTHER: '1' };
+  check('the replacement takes the key and leaves none in its environment for what it starts',
+    serverModule.takeTokenFromEnv(env) === TOKEN && !(serverModule.TOKEN_ENV in env) && env.OTHER === '1', JSON.stringify(env));
+  const junk = { [serverModule.TOKEN_ENV]: 'short' };
+  check('and a value that is not a key it made is ignored', serverModule.takeTokenFromEnv(junk) === null && !(serverModule.TOKEN_ENV in junk));
+  const asked = await post('/api/restart', {});
+  await new Promise((r) => setTimeout(r, 50));
+  check('the restart endpoint hands this launch\'s key on to the restart', asked.status === 200 && restartHandedToken === TOKEN, String(restartHandedToken));
+}
+
+// The real thing, end to end: the command line, a restart through the API, and
+// the same key still working on the replacement.
+{
+  const { spawn } = await import('node:child_process');
+  const cliPort = await new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const cli = spawn(process.execPath, [new URL('../bin/cli.js', import.meta.url).pathname, '--path', PROJECT, '--port', String(cliPort), '--no-open'], {
+    env: { ...process.env, [serverModule.TOKEN_ENV]: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  cli.stdout.on('data', (d) => { out += d; });
+  cli.stderr.on('data', (d) => { out += d; });
+  const waitFor = async (test, ms = 10000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (await test()) return true;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
+  };
+  const urlRe = new RegExp(`http://localhost:${cliPort}/#token=([A-Za-z0-9_-]{43})`);
+  await waitFor(() => urlRe.test(out));
+  const key = (out.match(urlRe) || [])[1];
+  check('the command line prints the whole address, key included', !!key, out);
+  const cliBase = `http://127.0.0.1:${cliPort}`;
+  const meta = async (k) => {
+    try {
+      const r = await fetch(`${cliBase}/api/projects`, { headers: { 'X-Dashboard-Token': k || '' } });
+      return { status: r.status, body: await r.json() };
+    } catch {
+      return { status: 0 };
+    }
+  };
+  if (key) {
+    const first = await meta(key);
+    check('and that key opens its API', first.status === 200, JSON.stringify(first));
+    const r = await fetch(`${cliBase}/api/restart`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dashboard-Token': key }, body: '{}' });
+    check('a restart through the API is accepted', r.status === 200, r.status);
+    let after = null;
+    const cameBack = await waitFor(async () => {
+      after = await meta(key);
+      return after.status === 200 && after.body.startedAt > first.body.startedAt;
+    }, 20000);
+    check('the replacement answers the same key the tab already holds', cameBack, JSON.stringify(after));
+    const printedAgain = [...out.matchAll(new RegExp(urlRe, 'g'))].map((m) => m[1]);
+    check('and prints the same address again', printedAgain.length === 2 && printedAgain[1] === key, JSON.stringify(printedAgain));
+    check('while a different key is still refused', (await meta(serverModule.newToken())).status === 403);
+  }
+  cli.kill('SIGTERM');
+  await new Promise((r) => (cli.exitCode !== null || cli.signalCode ? r() : cli.on('exit', r)));
+  check('stopping the command line stops the replacement too',
+    await waitFor(async () => (await meta(key)).status === 0, 5000));
+}
 
 // --- what the scan finds at all -------------------------------------------
 // Both of these were found by review: the scan looked for memory under a folder
@@ -1641,7 +1773,7 @@ check('and the row says where the link really points', linkedAgent?.symlink === 
     const settingsWas = fs.readFileSync(PROJECT_SETTINGS, 'utf8');
     const plain = await fetch(BASE + '/api/toggle/plugin', {
       method: 'POST',
-      headers: { 'Content-Type': 'text/plain', Origin: BASE },
+      headers: { 'Content-Type': 'text/plain', Origin: BASE, ...T },
       body: JSON.stringify({ projectPath: PROJECT, key: 'demo@market', enabled: false, scope: 'project' }),
     });
     check('a switch sent as plain text is refused even when the body is valid JSON',

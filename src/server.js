@@ -1,5 +1,6 @@
 import http from 'node:http';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -53,6 +54,48 @@ function isSameOrigin(req, port) {
   }
   return true;
 }
+
+// --- the launch key ------------------------------------------------------
+//
+// The checks above stop a web page in the browser. They do nothing against a
+// program on this machine — another user's, or a tool allowed to reach
+// localhost — which can send any Host and Origin it likes. So every /api/
+// request also has to carry a key made fresh at each launch, which only the
+// terminal that started the dashboard and the tab it opened ever see: it
+// travels in the address's #fragment (never sent to a server, never in a log
+// or a Referer), and the page sends it back in a header.
+export const TOKEN_HEADER = 'x-dashboard-token';
+// how a restart hands the key to the process that replaces this one: the
+// environment, which only this user can read, rather than the command line,
+// which every user on the machine can see in `ps`
+export const TOKEN_ENV = 'CLAUDE_DASHBOARD_TOKEN';
+const TOKEN_SHAPE = /^[A-Za-z0-9_-]{43}$/;
+
+export function newToken() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+// Takes the key a restart handed over, and removes it from this process's
+// environment, so nothing this process starts later inherits it by accident.
+// Anything not shaped like a key this code made is ignored.
+export function takeTokenFromEnv(env = process.env) {
+  const t = env[TOKEN_ENV];
+  delete env[TOKEN_ENV];
+  return typeof t === 'string' && TOKEN_SHAPE.test(t) ? t : null;
+}
+
+// Compared as hashes so that neither the length nor any prefix of the key can
+// be learned from how long a wrong one takes to refuse.
+function hasToken(req, token) {
+  const sent = req.headers[TOKEN_HEADER];
+  if (typeof sent !== 'string' || !sent) return false;
+  const a = crypto.createHash('sha256').update(sent).digest();
+  const b = crypto.createHash('sha256').update(token).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+const NO_TOKEN_MESSAGE =
+  'This tab does not have the key for this dashboard. Open the address the terminal printed when the dashboard started — the whole of it, including the part after "#token=".';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
@@ -147,20 +190,27 @@ function sourceChangedAt() {
   return newest;
 }
 
+// The open tab holds this launch's key, so the replacement is handed the same
+// one — through its environment, never its arguments.
+export function restartCommand(token, argv = process.argv, env = process.env) {
+  const args = argv.slice(1);
+  // the browser is already on this page — a second tab is not a restart
+  if (!args.includes('--no-open')) args.push('--no-open');
+  return { command: process.execPath, args, options: { stdio: 'inherit', env: { ...env, [TOKEN_ENV]: token } } };
+}
+
 // The banner above tells you to stop the dashboard and start it again; this is
 // that, done from the page. The port is handed to a fresh process started from
 // the same command line, and this one stays alive waiting for it instead of
 // detaching it: the terminal the dashboard was launched from keeps owning it,
 // so its output still goes there and Ctrl+C there still stops it.
-function restartSelf(server) {
+function restartSelf(server, { token } = {}) {
   let replaced = false;
   const replace = () => {
     if (replaced) return;
     replaced = true;
-    const argv = process.argv.slice(1);
-    // the browser is already on this page — a second tab is not a restart
-    if (!argv.includes('--no-open')) argv.push('--no-open');
-    const child = spawn(process.execPath, argv, { stdio: 'inherit' });
+    const { command, args, options } = restartCommand(token);
+    const child = spawn(command, args, options);
     child.on('error', (err) => {
       console.error(`could not start the dashboard again: ${err.message}`);
       process.exit(1);
@@ -181,8 +231,11 @@ function restartSelf(server) {
 }
 
 // onRestart is here so the tests can watch the endpoint without the test run
-// restarting itself.
-export function createServer(defaultProjectPath, port, { onRestart = restartSelf } = {}) {
+// restarting itself. There is no server without a key: leaving it out is a
+// mistake, not a way to switch the check off. A port of 0 means "whatever the
+// listener was given", read off the connection.
+export function createServer(defaultProjectPath, port, { onRestart = restartSelf, token } = {}) {
+  if (typeof token !== 'string' || !TOKEN_SHAPE.test(token)) throw new Error('createServer needs a token from newToken()');
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const pathname = url.pathname;
@@ -191,8 +244,11 @@ export function createServer(defaultProjectPath, port, { onRestart = restartSelf
       // Every API response carries real settings — including any keys inside an
       // MCP server's env block — so they all get the same origin check, not
       // just the ones that write.
-      if (pathname.startsWith('/api/') && !isSameOrigin(req, port)) {
+      if (pathname.startsWith('/api/') && !isSameOrigin(req, port || req.socket.localPort)) {
         return sendJson(res, 403, { error: 'request did not look like it came from this dashboard' });
+      }
+      if (pathname.startsWith('/api/') && !hasToken(req, token)) {
+        return sendJson(res, 403, { error: NO_TOKEN_MESSAGE, reason: 'token' });
       }
 
       if (req.method === 'GET' && pathname === '/api/inventory') {
@@ -232,7 +288,7 @@ export function createServer(defaultProjectPath, port, { onRestart = restartSelf
         await readJsonBody(req);
         const self = req.socket.server;
         // the answer has to be out the door before the socket is torn down
-        res.on('finish', () => onRestart(self));
+        res.on('finish', () => onRestart(self, { token }));
         return sendJson(res, 200, { ok: true, startedAt: STARTED_AT });
       }
 
@@ -299,5 +355,20 @@ export function createServer(defaultProjectPath, port, { onRestart = restartSelf
     } catch (err) {
       return sendJson(res, err.statusCode || 500, { error: String(err.message || err) });
     }
+  });
+}
+
+// What the command line and the tests both start: always on loopback only, so
+// the address the tests check is the address users get. Resolves once it is
+// listening, with the address to open — key included.
+export function startServer({ projectPath, port = 0, token = newToken(), onRestart } = {}) {
+  return new Promise((resolve, reject) => {
+    const server = createServer(projectPath, port, { token, ...(onRestart ? { onRestart } : {}) });
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => {
+      server.off('error', reject);
+      const actual = server.address().port;
+      resolve({ server, token, port: actual, url: `http://localhost:${actual}/#token=${token}` });
+    });
   });
 }

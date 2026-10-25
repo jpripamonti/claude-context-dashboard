@@ -31,7 +31,7 @@ w(path.join(HOME, '.claude.json'), JSON.stringify({ mcpServers: {}, projects: {}
 w(path.join(PROJECT, 'CLAUDE.md'), '# project rules\none\ntwo\nthree\n');
 w(path.join(OTHER, 'CLAUDE.md'), '# the other project\n');
 
-const { createServer } = await import('../src/server.js');
+const { startServer } = await import('../src/server.js');
 
 const net = await import('node:net');
 const PORT = await new Promise((resolve) => {
@@ -44,9 +44,11 @@ const PORT = await new Promise((resolve) => {
 // The restart is handed to the server rather than performed by it, so clicking
 // the button here does not restart the test run.
 let restartsAsked = 0;
-const server = createServer(PROJECT, PORT, { onRestart: () => { restartsAsked++; } });
-await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
+const { server, token: TOKEN } = await startServer({ projectPath: PROJECT, port: PORT, onRestart: () => { restartsAsked++; } });
 const BASE = `http://127.0.0.1:${PORT}`;
+// for the requests this file makes itself; the page's own carry whatever key
+// the page found, which is the point of several checks below
+const T = { 'X-Dashboard-Token': TOKEN };
 
 let failures = 0;
 let checksRun = 0;
@@ -70,7 +72,7 @@ const knownIds = idsIn(markup);
 // drawn in, its data attributes } — read from what the page drew
 let focused = null;
 
-const elements = new Map();
+let elements = new Map();
 function makeEl(id) {
   const classes = new Set();
   const attributes = {};
@@ -150,13 +152,26 @@ const windowStub = {
   },
 };
 
-// what the page asked for, so a check can say where a request went
+// what the page asked for, so a check can say where a request went. No key is
+// added here: a request carries one only if the page put it there.
 const requests = [];
 const fetchShim = async (url, opts = {}) => {
   const absolute = url.startsWith('http') ? url : BASE + url;
-  requests.push({ url, method: opts.method || 'GET', body: opts.body ? JSON.parse(opts.body) : null });
+  requests.push({ url, method: opts.method || 'GET', body: opts.body ? JSON.parse(opts.body) : null, headers: { ...(opts.headers || {}) } });
   return fetch(absolute, { ...opts, headers: { Origin: BASE, ...(opts.headers || {}) } });
 };
+
+// sessionStorage, one per page load, as a tab has
+const makeStorage = (initial = {}) => {
+  const data = new Map(Object.entries(initial));
+  return {
+    data,
+    getItem: (k) => (data.has(k) ? data.get(k) : null),
+    setItem: (k, v) => { data.set(k, String(v)); },
+    removeItem: (k) => { data.delete(k); },
+  };
+};
+const storage = makeStorage();
 
 let reloads = 0;
 const addresses = [];
@@ -164,11 +179,15 @@ let confirmAnswer = true;
 const asked = [];
 const alerted = [];
 
-const context = vm.createContext({
+// Opened the way the terminal's address opens it — the key in the fragment —
+// and on a project already in the address, which taking the key out must keep.
+const startSearch = `?path=${encodeURIComponent(PROJECT)}`;
+const pageGlobals = ({ hash, search, sessionStorage }) => ({
   document,
   window: windowStub,
-  location: { search: '', reload: () => { reloads++; } },
+  location: { pathname: '/', search, hash, reload: () => { reloads++; } },
   history: { replaceState: (state, title, url) => addresses.push(String(url)) },
+  sessionStorage,
   fetch: fetchShim,
   URLSearchParams,
   console,
@@ -180,7 +199,9 @@ const context = vm.createContext({
   },
   alert: (message) => alerted.push(message),
 });
-vm.runInContext(fs.readFileSync(new URL('../public/app.js', import.meta.url), 'utf8'), context, { filename: 'app.js' });
+const appSource = fs.readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+const context = vm.createContext(pageGlobals({ hash: `#token=${TOKEN}`, search: startSearch, sessionStorage: storage }));
+vm.runInContext(appSource, context, { filename: 'app.js' });
 
 // The page draws its buttons as HTML text, so a click is aimed by reading that
 // text back: the same data attributes and classes a real button would carry.
@@ -254,6 +275,17 @@ const editor = el('editor');
 for (let i = 0; i < 100 && !el('content').innerHTML.includes('block'); i++) await settle();
 check('the page loads the project it was started for',
   requests.some((r) => r.url.startsWith(`/api/inventory?path=${encodeURIComponent(PROJECT)}`)), JSON.stringify(requests));
+
+// --- the launch key ------------------------------------------------------
+check('the key in the address goes out with every request the page makes',
+  requests.length >= 2 && requests.every((r) => r.headers['X-Dashboard-Token'] === TOKEN), JSON.stringify(requests.map((r) => r.headers)));
+check('it is taken out of the address at once, keeping the project the address names',
+  addresses[0] === `/${startSearch}` && !addresses.some((a) => a.includes('#') || a.includes(TOKEN)), JSON.stringify(addresses));
+check('sizes are called bytes, which is what they count, not characters',
+  /bytes of text load before you type anything/.test(el('content').innerHTML) && !/\d characters\b/.test(el('content').innerHTML),
+  (el('content').innerHTML.match(/.{60}\d characters.{20}/) || [''])[0]);
+check('and kept for the tab, so a reload of that address still works',
+  [...storage.data.values()].includes(TOKEN), JSON.stringify([...storage.data.keys()]));
 
 // --- what the markup promises -------------------------------------------
 {
@@ -407,7 +439,7 @@ check('and a version\'s size is given in bytes, which is what is measured',
   /· [\d,.\s]+ bytes/.test(el('editor-history').innerHTML) && !/· \d+ characters/.test(el('editor-history').innerHTML),
   (el('editor-history').innerHTML.match(/version-when">[^<]*/) || [''])[0]);
 
-const list = await (await fetch(`${BASE}/api/file/backups?path=${encodeURIComponent(projectMd)}&project=${encodeURIComponent(PROJECT)}`, { headers: { Origin: BASE } })).json();
+const list = await (await fetch(`${BASE}/api/file/backups?path=${encodeURIComponent(projectMd)}&project=${encodeURIComponent(PROJECT)}`, { headers: { Origin: BASE, ...T } })).json();
 const newest = list.versions[0];
 check('the row for a version carries the id the page will send back',
   buttonsIn(el('editor-history').innerHTML).some((b) => b.dataset.action === 'version-diff' && b.dataset.id === newest.id),
@@ -429,7 +461,7 @@ check('putting a version back asks first, then writes it',
 check('and the editor shows what is now in the file',
   editorText.value === '# version A\nline one\nline two\n', JSON.stringify(editorText.value));
 check('what it replaced was kept as a version too',
-  (await (await fetch(`${BASE}/api/file/backups?path=${encodeURIComponent(projectMd)}&project=${encodeURIComponent(PROJECT)}`, { headers: { Origin: BASE } })).json()).versions.length > list.versions.length);
+  (await (await fetch(`${BASE}/api/file/backups?path=${encodeURIComponent(projectMd)}&project=${encodeURIComponent(PROJECT)}`, { headers: { Origin: BASE, ...T } })).json()).versions.length > list.versions.length);
 
 // --- a file that can be read but not written --------------------------
 const pluginSkill = path.join(HOME, '.claude', 'plugins', 'cache', 'demo', 'skills', 'thing', 'SKILL.md');
@@ -637,7 +669,7 @@ check('and when it is older, the page says so and offers to start it again',
   /running since/.test(stale) && buttonsIn(stale).some((b) => b.dataset.action === 'restart'), stale);
 
 // the page must not die on an answer that is missing something it now asks for
-const full = await (await fetch(`${BASE}/api/inventory?path=${encodeURIComponent(PROJECT)}`, { headers: { Origin: BASE } })).json();
+const full = await (await fetch(`${BASE}/api/inventory?path=${encodeURIComponent(PROJECT)}`, { headers: { Origin: BASE, ...T } })).json();
 delete full.coverage;
 let threw = null;
 try {
@@ -673,7 +705,7 @@ check('and no link is left pointing at the part that is not there',
     drawn.includes('id="references"') && buttonsIn(drawn).some((b) => b.dataset.action === 'edit' && b.dataset.path === pointed),
     drawn.includes('id="references"'));
   check('the section says how much text is behind the pointers, since that is the point of it',
-    el('content').innerHTML.includes(`<strong>${fs.statSync(pointed).size} characters</strong> of text sit behind`),
+    el('content').innerHTML.includes(`<strong>${fs.statSync(pointed).size} bytes</strong> of text sit behind`),
     (el('content').innerHTML.match(/<div class="section-note">[\s\S]{0,120}/) || [''])[0]);
   check('and the side nav links to it',
     el('side-nav').innerHTML.includes('#references'), el('side-nav').innerHTML.slice(0, 300));
@@ -738,6 +770,41 @@ check('clicking it asks the server, as a POST',
 check('and the server takes that as the restart it is',
   restartsAsked === restartsBefore + 1, `${restartsAsked} vs ${restartsBefore}`);
 check('and the page does not reload before the replacement answers', reloads === 0, reloads);
+check('the restart carries the key too, so the replacement knows the page',
+  restartRequests.length === 1 && restartRequests[0].headers['X-Dashboard-Token'] === TOKEN, JSON.stringify(restartRequests[0]?.headers));
+
+// --- loading the page again -----------------------------------------------
+// A fresh page each time: its own elements and its own requests. The first
+// page is done with — nothing below clicks it.
+const bootAgain = async ({ hash, search, sessionStorage }) => {
+  elements = new Map();
+  requests.length = 0;
+  addresses.length = 0;
+  const page = vm.createContext(pageGlobals({ hash, search, sessionStorage }));
+  vm.runInContext(appSource, page, { filename: 'app.js' });
+  for (let i = 0; i < 100 && !el('content').innerHTML && !el('status-line').textContent; i++) await settle();
+  await settle();
+};
+// a reload: the address no longer has the key, the tab's storage does
+await bootAgain({ hash: '', search: startSearch, sessionStorage: storage });
+check('a reload of the address without the key still loads, from the key kept for the tab',
+  el('content').innerHTML.includes('block') && requests.length >= 2 && requests.every((r) => r.headers['X-Dashboard-Token'] === TOKEN),
+  JSON.stringify({ status: el('status-line').textContent, headers: requests.map((r) => r.headers) }));
+// a tab with no key at all, and one whose storage cannot be used
+await bootAgain({ hash: '', search: '', sessionStorage: makeStorage() });
+check('a page without the key says, in its status line, to open the address the terminal printed',
+  /terminal printed/.test(el('status-line').textContent) && el('status-line').classList.contains('error') &&
+  !requests.some((r) => r.url.startsWith('/api/inventory')),
+  JSON.stringify({ status: el('status-line').textContent, urls: requests.map((r) => r.url) }));
+const broken = { getItem() { throw new Error('denied'); }, setItem() { throw new Error('denied'); } };
+await bootAgain({ hash: `#token=${TOKEN}`, search: '', sessionStorage: broken });
+check('storage that refuses does not stop the key in the address from working',
+  el('content').innerHTML.includes('block') && requests.every((r) => r.headers['X-Dashboard-Token'] === TOKEN) && addresses[0] === '/',
+  JSON.stringify({ status: el('status-line').textContent, addresses }));
+// a different key in the address beats a stale one kept for the tab
+await bootAgain({ hash: `#token=${TOKEN}`, search: '', sessionStorage: makeStorage({ 'claude-context-dashboard.token': 'stale-key-from-an-earlier-launch' }) });
+check('a key in the address wins over an older one kept for the tab',
+  requests.length >= 1 && requests.every((r) => r.headers['X-Dashboard-Token'] === TOKEN), JSON.stringify(requests.map((r) => r.headers)));
 
 server.close();
 if (failures) {

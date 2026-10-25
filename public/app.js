@@ -9,8 +9,58 @@ function escapeHtml(s) {
   }[c]));
 }
 
+// --- the launch key --------------------------------------------------------
+//
+// The dashboard answers only requests that carry the key it printed when it
+// started. It arrives once, in the address's #fragment; it is kept for this tab
+// in sessionStorage (so a reload still works) and taken out of the address
+// straight away, so it is not left in the history, a bookmark or a copied link.
+const TOKEN_STORE_KEY = 'claude-context-dashboard.token';
+let dashboardToken = null;
+
+function tokenFromAddress() {
+  const hash = String(location.hash || '').replace(/^#/, '');
+  if (!hash) return null;
+  return new URLSearchParams(hash).get('token') || null;
+}
+
+// A key in the address wins over the one kept for the tab: it is the one the
+// dashboard running now printed. Answers whether the address carried one.
+function takeToken() {
+  const fromAddress = tokenFromAddress();
+  if (fromAddress) {
+    dashboardToken = fromAddress;
+    try {
+      sessionStorage.setItem(TOKEN_STORE_KEY, fromAddress);
+    } catch {
+      /* no storage: this tab works until it is reloaded */
+    }
+    try {
+      // the path and query stay — ?path= is what brings a reload back to the project
+      history.replaceState(null, '', `${location.pathname || '/'}${location.search || ''}`);
+    } catch {
+      /* an address that cannot be changed still leaves a working page */
+    }
+    return true;
+  }
+  if (!dashboardToken) {
+    try {
+      dashboardToken = sessionStorage.getItem(TOKEN_STORE_KEY) || null;
+    } catch {
+      dashboardToken = null;
+    }
+  }
+  return false;
+}
+
+function withToken(opts) {
+  const headers = { ...((opts && opts.headers) || {}) };
+  if (dashboardToken) headers['X-Dashboard-Token'] = dashboardToken;
+  return { ...(opts || {}), headers };
+}
+
 async function fetchJson(url, opts) {
-  const res = await fetch(url, opts);
+  const res = await fetch(url, withToken(opts));
   const data = await res.json();
   if (!res.ok || data.error) throw new Error(data.error || `request to ${url} failed`);
   return data;
@@ -252,7 +302,7 @@ function renderWeight(weight) {
 
   const body = `
     <div class="weigh-total">
-      <strong>${num(measuredBytes)}</strong> characters load before you type anything
+      <strong>${num(measuredBytes)}</strong> bytes of text load before you type anything
       <span class="muted">— roughly ${roughTokens(measuredBytes)} tokens, as a rough conversion</span>
     </div>
     ${bars}
@@ -288,7 +338,7 @@ function importRows(f) {
       ? `<span class="dead">could not be read (${escapeHtml(i.error)}) — this line brings in no text</span>`
       : i.alreadyPulledIn
       ? '<span class="muted">already pulled in above — counted once</span>'
-      : `${num(i.bytes)} characters${i.level > 1 ? ` — pulled in by ${escapeHtml(i.via.split('/').pop())}, not by this file` : ''}`;
+      : `${num(i.bytes)} bytes${i.level > 1 ? ` — pulled in by ${escapeHtml(i.via.split('/').pop())}, not by this file` : ''}`;
     const open = i.missing || i.error || i.alreadyPulledIn ? '' : ` ${editButton(i.path, 'Open')}`;
     return `<div class="layer" style="--depth:${i.level - 1}">
       <div class="layer-spec">@${escapeHtml(i.spec)}</div>
@@ -305,7 +355,7 @@ function renderClaudeMd(data) {
     title: f.path.split('/').pop().replace(/\.disabled$/, ''),
     badges: [
       badge(f.label, 'accent'),
-      badge(`${num(f.bytes)} characters`),
+      badge(`${num(f.bytes)} bytes`),
       importedBytes(f) ? badge(`+ ${num(importedBytes(f))} pulled in by "@" lines`, 'accent') : '',
       f.disabled ? badge('switched off', 'off') : '',
       f.hasTwin ? badge('a switched-off copy also exists', 'off') : '',
@@ -345,7 +395,7 @@ function renderReferences(refs) {
   const rows = refs.files.map((r) => item({
     title: r.path.split('/').pop(),
     badges: [
-      badge(`${num(r.bytes)} characters`),
+      badge(`${num(r.bytes)} bytes`),
       r.level > 1 ? badge(`${r.level} steps from an instructions file`, 'accent') : '',
     ],
     path: r.path,
@@ -355,9 +405,9 @@ function renderReferences(refs) {
     `,
   })).join('');
   // The total is the point of the section on a real project: a CLAUDE.md of a
-  // few thousand characters routinely has ten times that sitting a pointer away.
+  // few thousand bytes routinely has ten times that sitting a pointer away.
   const total = refs.files.reduce((n, r) => n + r.bytes, 0);
-  const note = `<div class="section-note"><strong>${num(total)} characters</strong> of text sit behind these pointers.
+  const note = `<div class="section-note"><strong>${num(total)} bytes</strong> of text sit behind these pointers.
     None of it is loaded on its own and none of it counts towards the weight above — it arrives only if Claude follows
     the pointer, which is what the wording around it is usually asking for.${
     refs.truncated ? ` Only the first ${refs.limit} are listed; there are more, so the real figure is higher.` : ''
@@ -566,7 +616,7 @@ function renderFileList(id, icon, title, list) {
       badges: [
         badge(s.scope, s.scope === 'global' ? 'accent' : ''),
         s.disabled ? badge('disabled', 'off') : badge('enabled', 'on'),
-        s.disabled ? '' : badge(`${num(s.startupBytes || 0)} characters loaded up front`),
+        s.disabled ? '' : badge(`${num(s.startupBytes || 0)} bytes loaded up front`),
       ],
       path: s.symlink ? `${s.path}  →  ${s.symlink}` : s.path,
       desc: s.description,
@@ -722,11 +772,11 @@ async function restartDashboard(btn) {
   btn.textContent = 'Starting it again…';
   let refusal = null;
   try {
-    const res = await fetch('/api/restart', {
+    const res = await fetch('/api/restart', withToken({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
-    });
+    }));
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       refusal = body.error || `the dashboard answered ${res.status}`;
@@ -888,7 +938,16 @@ async function switchProject(projectPath, alreadyAsked = false) {
 }
 
 async function init() {
-  const meta = await fetchJson('/api/projects');
+  let meta;
+  try {
+    meta = await fetchJson('/api/projects');
+  } catch (err) {
+    // most often the key: a tab opened without the printed address, or kept
+    // from an earlier launch. The server's own words say what to do.
+    showStatus(err.message, true);
+    document.getElementById('content').innerHTML = `<div class="error-banner">${ICONS.alert}<div>${escapeHtml(err.message)}</div></div>`;
+    return;
+  }
   serverMeta = meta;
   const requestedPath = new URLSearchParams(location.search).get('path');
   const startPath = requestedPath || meta.defaultProjectPath;
@@ -1471,5 +1530,12 @@ document.addEventListener('keydown', (ev) => {
     saveEditor();
   }
 });
+// The printed address opened in a tab already on this page changes only the
+// fragment, which loads nothing: take the new key and start over with it
+// (unsaved typing is asked about by the beforeunload warning above).
+window.addEventListener('hashchange', () => {
+  if (takeToken()) location.reload();
+});
 
+takeToken();
 init();
