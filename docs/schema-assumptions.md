@@ -11,8 +11,8 @@ tells you which ones hold. It reads and writes nothing else; see
 
 Each entry says what breaks if the assumption is wrong. Mostly, reading is the
 forgiving half: a file with an unexpected shape is skipped and a section of the
-page comes up empty. But not always — a few shapes (A7, A10) are walked without
-being checked first, and take the whole page down rather than one section. The
+page comes up empty. But not always — a few shapes (A7, A10) are skipped by the part
+that cannot use them, with a partial warning at the top, and the rest of the page is unaffected. The
 half that matters is writing: a switch can write something Claude Code then
 ignores, and the page reports success for a change that did not happen. Where
 that is the risk, the row says so.
@@ -23,15 +23,15 @@ cannot be settled by reading files.
 
 | # | File | Assumed | If it's wrong |
 |---|------|---------|---------------|
-| A1 | `~/.claude.json` | Exists and is a JSON **object**. | Global and per-project MCP servers are not listed. It is not fatal for writing: the first switch creates the file from scratch, which is fine for a missing file and destructive-looking for one that holds something this cannot parse (the backup keeps it). |
-| A2 | `~/.claude.json` → `mcpServers` | An object, server name → definition object. | Global servers are listed under nonsense keys rather than not at all. Worse on the write side: if it is an **array**, switching a server off assigns a named property that `JSON.stringify` then drops, and the definition is gone from the file (it survives only in the backup). |
+| A1 | `~/.claude.json` | Exists and is a JSON **object**. | Global and per-project MCP servers are not listed. Writing is guarded: a switch creates a missing file, but for one that exists and is not valid JSON, or not an object, it is refused with "Fix it by hand first" and the file is left untouched. |
+| A2 | `~/.claude.json` → `mcpServers` | An object, server name → definition object. | Global servers are listed under nonsense keys rather than not at all. On the write side it is safe: if it is an **array** (or anything but an object), switching a server off or moving it is refused and the file is left untouched. |
 | A3 | `~/.claude.json` → `projects` | An object keyed by the project's **real** absolute path — the path with every symlink resolved, which is what the dashboard looks up. | Private per-project servers are not listed, and a switch writes a second key beside the one Claude Code reads: it reports success and changes nothing. |
 | A4 | `~/.claude.json` → `disabledUserMcpServers`, and `projects[p].disabledLocalMcpServers` | This dashboard's **own** shadow keys, holding servers it switched off. Claude Code ignores unknown keys here (the file is internal state, not schema-validated). | If Claude Code ever validates this file, switched-off servers could be dropped instead of parked. Their definitions are also in the backup taken before the write. |
 | A5 | The four settings files: `~/.claude/settings.json`, `~/.claude/settings.local.json`, `<project>/.claude/settings.json`, `<project>/.claude/settings.local.json` | Each is a JSON object, and these are all the layers that exist (aside from enterprise-managed settings, which are not read). | A layer that is not read means the page attributes a setting to the wrong file — and a switch writes the wrong file. |
 | A6 | Settings → `enabledPlugins` | Object, `plugin@marketplace` → boolean. | Plugin switches write a key Claude Code ignores. |
 | A7 | Settings → `enabledMcpjsonServers` / `disabledMcpjsonServers` / `enableAllProjectMcpServers` | Two arrays of server names and a boolean. | Servers shared through `.mcp.json` show the wrong state and their switch writes something inert. If either key holds something that is not an array, the scan ignores that key, names the file in a partial warning at the top, and carries on; the rest of the page is unaffected. |
 | A8 | Settings → `hooks` | Object, event name → array of `{ matcher, hooks: [{ type: "command", command }] }`. | Hooks of an unknown type are still listed, and switching one off still parks and restores it verbatim. A non-array under an event is skipped silently; a shape the switch cannot place raises a visible error rather than reporting a success. |
-| A9 | Settings → `permissions` | Object with `allow` / `deny` / `ask` arrays of rule strings. | Rules are not listed. Adding one is the damage: a list that is not an array is **replaced** by a fresh one holding only the new rule, and the old rules survive only in the backup. |
+| A9 | Settings → `permissions` | Object with `allow` / `deny` / `ask` arrays of rule strings. | Rules are not listed. Adding one is refused, with the file untouched, when a list is not an array. |
 | A10 | `~/.claude/plugins/installed_plugins.json` | `{ plugins: { "name@marketplace": [record, …] } }`, each record `{ scope: "user" \| "local", installPath, version }`, and `projectPath` on a `local` one. | A record that is not in an array, or without an `installPath` string, is skipped and named in a partial warning; the rest of the page is unaffected. A plugin the page never lists also never contributes its skills to the startup weight. |
 | A11 | `<installPath>/.claude-plugin/plugin.json` | The plugin's manifest: `name`, `description`, `author.name`. | The plugin is listed without its description. Harmless. |
 | A12 | A plugin's contents | `commands/*.md`, `agents/*.md`, `skills/<name>/SKILL.md`, `hooks/hooks.json`, in folders of those names inside `installPath` — a manifest cannot point them somewhere else. | "Contributes:" undercounts what the plugin adds, and its skills are missing from the startup weight. |

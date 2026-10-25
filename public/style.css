@@ -197,9 +197,6 @@ button:hover, select:hover { border-color: var(--accent); color: var(--accent-te
   font-variant-numeric: tabular-nums;
 }
 
-.nav-item.has-warning { color: var(--warn); }
-.nav-item.has-warning svg { opacity: 1; }
-
 main {
   min-width: 0;
   padding: 22px 24px 60px;
@@ -874,15 +871,6 @@ section.block > .controls {
   color: var(--text);
 }
 
-/* --- top bar rows ------------------------------------------------------ */
-
-.top-bar-row {
-  display: flex;
-  align-items: center;
-  gap: 12px 20px;
-  min-width: 0;
-}
-
 /* --- phone ------------------------------------------------------------- */
 
 @media (max-width: 700px) {
@@ -894,8 +882,6 @@ section.block > .controls {
     gap: 8px 12px;
     padding: 10px 16px;
   }
-
-  .top-bar-row { flex-wrap: wrap; width: 100%; }
 
   /* the header scrolls away at this width, so nothing sits above the status line */
   .status-line { top: 8px; }

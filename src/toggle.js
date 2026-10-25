@@ -808,7 +808,7 @@ function renameToggle(real, enabled) {
 // --- editing anything the dashboard shows ---------------------------------
 
 // A file may only be read back or written if the dashboard is currently
-// listing it for this project (see collectEditablePaths). Files that belong to
+// listing it for this project (see editablePathsFrom). Files that belong to
 // an installed plugin are never writable — they are replaced whenever the
 // plugin updates, so an edit there would silently disappear.
 // The path must be one the dashboard listed, spelled exactly as it listed it.
