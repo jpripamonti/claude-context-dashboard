@@ -810,6 +810,7 @@ details[open] summary::before { content: "▾ "; }
 .weigh-item-name { min-width: 0; overflow-wrap: anywhere; }
 
 .weigh-item-detail {
+  white-space: nowrap;
   font-size: 11px;
   color: var(--muted-2);
   margin-left: 8px;
@@ -828,6 +829,10 @@ section.block > .controls {
 /* --- status line (what the last write did) ---------------------------- */
 
 .status-line {
+  /* stays in view while scrolled down, so a write's result is never off screen */
+  position: sticky;
+  top: calc(var(--header-h) + 8px);
+  z-index: 5;
   margin: 0 0 12px;
   padding: 8px 12px;
   border: 1px solid var(--border);
@@ -891,6 +896,9 @@ section.block > .controls {
   }
 
   .top-bar-row { flex-wrap: wrap; width: 100%; }
+
+  /* the header scrolls away at this width, so nothing sits above the status line */
+  .status-line { top: 8px; }
 
   .project-picker {
     flex: 1 1 100%;

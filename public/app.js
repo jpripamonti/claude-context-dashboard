@@ -793,6 +793,22 @@ function showStatus(message, isError = false) {
   line.textContent = message;
   if (isError) line.classList.add('error');
   else line.classList.remove('error');
+  // an error used to be a pop-up nobody could miss; the line sits at the top of
+  // the page, so a failure is brought into view if the page is scrolled past it
+  if (isError && message) revealStatus(line);
+}
+
+function revealStatus(line) {
+  try {
+    const box = line.getBoundingClientRect();
+    const header = document.getElementById('top-bar').getBoundingClientRect();
+    const topEdge = Math.max(0, header.bottom);
+    if (box.top < topEdge || box.bottom > window.innerHeight) {
+      window.scrollBy({ top: box.top - topEdge - 12, behavior: 'smooth' });
+    }
+  } catch {
+    /* nothing to measure with (or nothing to scroll): the line is still there */
+  }
 }
 
 // Says which file a write landed in and that a copy was kept, in the words of
@@ -844,7 +860,8 @@ async function loadInventory(projectPath) {
       content.innerHTML = staleWarning(serverMeta)
         + `<div class="error-banner">${ICONS.alert}<div>${escapeHtml(err.message)}</div></div>`;
     } else {
-      showStatus(`Could not load ${projectPath}: ${err.message}. Still showing ${displayPath(currentProjectPath)}.`, true);
+      const why = err.message.includes(projectPath) ? err.message : `Could not load ${projectPath}: ${err.message}`;
+      showStatus(`${displayText(why)}${/[.!?]$/.test(why) ? '' : '.'} Still showing ${displayPath(currentProjectPath)}.`, true);
     }
     return false;
   } finally {

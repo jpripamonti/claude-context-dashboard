@@ -1385,7 +1385,9 @@ check('and the row says where the link really points', linkedAgent?.symlink === 
   // A request body arrives in pieces, and a character can straddle two of them:
   // decoding each piece on its own turned a few of a long file's "—" into U+FFFD.
   {
-    const long = Array.from({ length: 20000 }, (_, i) => `line ${i} — some prose here, é ok`).join('\n') + '\n';
+    // two- and three-byte characters back to back, long enough to arrive in
+    // many pieces, so some piece boundary always falls inside one
+    const long = 'é'.repeat(300000) + '\n' + Array.from({ length: 20000 }, (_, i) => `line ${i} — some prose here, é ok`).join('\n') + '\n';
     res = await saveTo(projectMd, long);
     const back = fs.readFileSync(projectMd, 'utf8');
     check('a long save full of characters wider than a byte comes back exactly as sent',
@@ -1608,6 +1610,15 @@ check('and the row says where the link really points', linkedAgent?.symlink === 
     check('and saving it is refused, leaving the file it really is alone',
       res.status === 400 && fs.readFileSync(path.join(OUT, 'CLAUDE.md'), 'utf8') === '# lives outside\n',
       `${res.status} ${JSON.stringify(res.body)}`);
+    // the same project named through a link of its own: the paths the page
+    // sends are built from where the project really is, not from that name
+    const P4_ALIAS = path.join(SANDBOX, 'linked-sub-alias');
+    fs.symlinkSync(P4, P4_ALIAS);
+    res = await post('/api/file/save', { filePath: linkedMd, projectPath: P4_ALIAS, content: 'PWNED\n', expectedMtimeMs: opened.mtimeMs });
+    check('and so is a save naming the project through a link',
+      res.status === 400 && /outside this project/.test(res.body.error || '') &&
+      fs.readFileSync(path.join(OUT, 'CLAUDE.md'), 'utf8') === '# lives outside\n', `${res.status} ${JSON.stringify(res.body)}`);
+    fs.unlinkSync(P4_ALIAS);
     fs.rmSync(P4, { recursive: true, force: true });
   }
 

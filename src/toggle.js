@@ -485,10 +485,12 @@ function assertStaysInProject(filePath, projectPath, { rename = false } = {}) {
   const listed = path.resolve(filePath);
   const root = path.resolve(projectPath);
   const dir = path.dirname(listed);
+  const realRoot = realLocation(root);
   // Only a file that names itself a project file is checked: global files are
   // global by name, and the home folder viewed as a project holds ~/.claude.
-  if (!isWithin(dir, root) || isWithin(dir, paths.GLOBAL_CLAUDE_DIR)) return;
-  const realRoot = realLocation(root);
+  // The project may be named through a link of its own while the inventory's
+  // paths are built from where it really is, so either spelling counts.
+  if (!(isWithin(dir, root) || isWithin(dir, realRoot)) || isWithin(dir, paths.GLOBAL_CLAUDE_DIR)) return;
   const realGlobal = realLocation(paths.GLOBAL_CLAUDE_DIR);
   const realDir = realLocation(dir);
   if (isWithin(realDir, realGlobal) || !isWithin(realDir, realRoot)) {
