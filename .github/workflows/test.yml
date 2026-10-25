@@ -1,0 +1,24 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [18, 20, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # No install step: the project has no dependencies.
+      # The suites run against a throwaway HOME. bin/check-config.js is not run
+      # here: it inspects the real ~/.claude of the machine it runs on, which a
+      # CI runner does not have, so it would only report "absent".
+      - run: npm test

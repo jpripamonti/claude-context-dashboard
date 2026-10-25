@@ -10,6 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import childProcess from 'node:child_process';
 
 const SANDBOX = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ccd-test-')));
 const HOME = path.join(SANDBOX, 'home');
@@ -32,7 +33,8 @@ w(path.join(PROJECT, 'CLAUDE.md'), '# project rules\n');
 w(path.join(PROJECT, '.claude', 'settings.json'), JSON.stringify({}, null, 2));
 
 // imported after HOME is redirected above, so the modules read the fake home
-const { createServer } = await import('../src/server.js');
+const serverModule = await import('../src/server.js');
+const { startServer } = serverModule;
 const toggle = await import('../src/toggle.js');
 
 // Ask the machine for a free port first — the server needs to know its own
@@ -48,18 +50,27 @@ const PORT = await new Promise((resolve) => {
 });
 // The restart is handed to the server rather than performed by it, so this
 // suite can watch the endpoint without restarting the test run.
+// Started the way the command line starts it, so the address it listens on is
+// the one users get.
 let restartsAsked = 0;
-const server = createServer(PROJECT, PORT, { onRestart: () => { restartsAsked++; } });
-await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
+let restartHandedToken = null;
+const started = await startServer({
+  projectPath: PROJECT,
+  port: PORT,
+  onRestart: (_server, handed = {}) => { restartsAsked++; restartHandedToken = handed.token; },
+});
+const { server, token: TOKEN } = started;
 
 const BASE = `http://127.0.0.1:${PORT}`;
-const H = { 'Content-Type': 'application/json', Origin: BASE, Host: `127.0.0.1:${PORT}` };
+// every API request needs this launch's key; the checks that leave it out say so
+const T = { 'X-Dashboard-Token': TOKEN };
+const H = { 'Content-Type': 'application/json', Origin: BASE, Host: `127.0.0.1:${PORT}`, ...T };
 const post = async (p, body) => {
   const res = await fetch(BASE + p, { method: 'POST', headers: H, body: JSON.stringify(body) });
   return { status: res.status, body: await res.json() };
 };
 const get = async (p) => {
-  const res = await fetch(BASE + p, { headers: { Origin: BASE } });
+  const res = await fetch(BASE + p, { headers: { Origin: BASE, ...T } });
   return { status: res.status, body: await res.json() };
 };
 const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -67,6 +78,13 @@ const inventory = async (p = PROJECT) => (await get(`/api/inventory?path=${encod
 const parkedFile = path.join(HOME, '.claude-context-dashboard', 'parked.json');
 
 let failures = 0;
+function spawnSyncOk(cmd, args) {
+  try {
+    return childProcess.spawnSync(cmd, args, { stdio: 'ignore' }).status === 0;
+  } catch {
+    return false;
+  }
+}
 let checksRun = 0;
 const check = (label, cond, detail) => {
   checksRun++;
@@ -972,8 +990,15 @@ w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
   // what is left is the newest copy of every file, which is never given up
   process.env.CLAUDE_DASHBOARD_BACKUP_BUDGET = '1';
   const before = fs.readdirSync(backupsDir).length;
+  const fileOf = (n) => n.replace(/\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.bak$/, '');
+  const filesBefore = new Set(fs.readdirSync(backupsDir).map(fileOf));
   await saveTo(projectMd, '# after the budget\n');
   const after = fs.readdirSync(backupsDir);
+  // counting copies per file cannot see a file that has none left at all
+  const filesAfter = new Set(after.map(fileOf));
+  check('every file that had a copy before the budget bit still has one',
+    filesBefore.size > 1 && [...filesBefore].every((f) => filesAfter.has(f)),
+    `${[...filesBefore].filter((f) => !filesAfter.has(f)).length} of ${filesBefore.size} files left with none`);
   check('a budget that bites clears the oldest copies', after.length < before, `${before} → ${after.length}`);
   check('and it comes down to the newest of each file, nothing more',
     after.length === new Set(after.map((n) => n.replace(/\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.bak$/, ''))).size,
@@ -1272,23 +1297,34 @@ w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
 
   const notJson = await fetch(BASE + '/api/restart', {
     method: 'POST',
-    headers: { 'Content-Type': 'text/plain', Origin: BASE },
+    headers: { 'Content-Type': 'text/plain', Origin: BASE, ...T },
     body: 'restart',
   });
   await new Promise((r) => setTimeout(r, 50));
   check('a post that is not JSON does not restart anything',
     notJson.status === 400 && restartsAsked === before + 1, `${notJson.status} restarts=${restartsAsked - before}`);
 
+  // the body above is not JSON either, so it would be refused by the parser
+  // alone; a valid one under the wrong type is what tests the type check
+  const validButPlain = await fetch(BASE + '/api/restart', {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain', Origin: BASE, ...T },
+    body: '{}',
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  check('valid JSON sent as plain text does not restart anything either',
+    validButPlain.status === 400 && restartsAsked === before + 1, `${validButPlain.status} restarts=${restartsAsked - before}`);
+
   const fromElsewhere = await fetch(BASE + '/api/restart', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example' },
+    headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example', ...T },
     body: '{}',
   });
   await new Promise((r) => setTimeout(r, 50));
   check('and neither does another page in the same browser',
     fromElsewhere.status === 403 && restartsAsked === before + 1, `${fromElsewhere.status} restarts=${restartsAsked - before}`);
 
-  const asGet = await fetch(`${BASE}/api/restart`, { headers: { Origin: BASE } });
+  const asGet = await fetch(`${BASE}/api/restart`, { headers: { Origin: BASE, ...T } });
   await new Promise((r) => setTimeout(r, 50));
   check('and neither does merely visiting the address',
     asGet.status === 404 && restartsAsked === before + 1, `${asGet.status} restarts=${restartsAsked - before}`);
@@ -1297,18 +1333,18 @@ w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
 // --- CSRF -------------------------------------------------------------
 const foreign = await fetch(BASE + '/api/file/save', {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example', Host: `127.0.0.1:${PORT}` },
+  headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example', Host: `127.0.0.1:${PORT}`, ...T },
   body: JSON.stringify({ filePath: projectMd, projectPath: PROJECT, content: 'x' }),
 });
 check('foreign origin blocked on save', foreign.status === 403, foreign.status);
 const foreignInv = await fetch(`${BASE}/api/inventory?path=${encodeURIComponent(PROJECT)}`, {
-  headers: { Origin: 'http://evil.example' },
+  headers: { Origin: 'http://evil.example', ...T },
 });
 check('foreign origin blocked on the inventory too', foreignInv.status === 403, foreignInv.status);
 // fetch() refuses to set Host, so this one needs a raw request
 const http = await import('node:http');
-const rawStatus = (headers) => new Promise((resolve, reject) => {
-  const req = http.request({ host: '127.0.0.1', port: PORT, path: '/api/inventory', headers }, (r) => {
+const rawStatus = (headers, withKey = true) => new Promise((resolve, reject) => {
+  const req = http.request({ host: '127.0.0.1', port: PORT, path: '/api/inventory', headers: withKey ? { ...T, ...headers } : headers }, (r) => {
     r.resume();
     resolve(r.statusCode);
   });
@@ -1318,6 +1354,299 @@ const rawStatus = (headers) => new Promise((resolve, reject) => {
 check('foreign host blocked', (await rawStatus({ Host: 'evil.example' })) === 403);
 check('a rebinding hostname is blocked', (await rawStatus({ Host: `attacker.test:${PORT}` })) === 403);
 check('the dashboard\'s own host is accepted', (await rawStatus({ Host: `localhost:${PORT}` })) === 200);
+
+// --- the launch key ------------------------------------------------------
+// Host and Origin only stop a browser: any program on the machine can send
+// the right ones. What it cannot send is the key this launch printed.
+{
+  check('the server listens on loopback only', server.address().address === '127.0.0.1', JSON.stringify(server.address()));
+  check('and the address it gives to open carries the key in the fragment',
+    started.url === `http://localhost:${PORT}/#token=${TOKEN}` && /^[A-Za-z0-9_-]{43}$/.test(TOKEN), started.url);
+  const local = { Host: `127.0.0.1:${PORT}` };
+  check('a request with the right Host but no key is refused',
+    (await rawStatus(local, false)) === 403);
+  const noKeyGet = await fetch(`${BASE}/api/projects`, { headers: { Origin: BASE } });
+  const noKeyBody = await noKeyGet.json();
+  check('a GET without the key is refused, saying to open the address the terminal printed',
+    noKeyGet.status === 403 && /terminal printed/.test(noKeyBody.error) && !JSON.stringify(noKeyBody).includes(TOKEN),
+    `${noKeyGet.status} ${JSON.stringify(noKeyBody)}`);
+  const readTarget = path.join(HOME, '.zshrc');
+  const noKeyRead = await fetch(`${BASE}/api/file?path=${encodeURIComponent(readTarget)}&project=${encodeURIComponent(HOME)}`, { headers: { Origin: BASE } });
+  const noKeyReadBody = await noKeyRead.text();
+  check('reading a file without the key is refused before anything is read',
+    noKeyRead.status === 403 && !noKeyReadBody.includes('ORIGINAL SHELL CONFIG'), `${noKeyRead.status} ${noKeyReadBody.slice(0, 120)}`);
+  const settingsWas = fs.readFileSync(path.join(PROJECT, '.claude', 'settings.json'), 'utf8');
+  const noKeyPost = await fetch(`${BASE}/api/toggle/plugin`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: BASE },
+    body: JSON.stringify({ projectPath: PROJECT, key: 'nokey@market', enabled: false, scope: 'project' }),
+  });
+  check('a POST without the key is refused and writes nothing',
+    noKeyPost.status === 403 && fs.readFileSync(path.join(PROJECT, '.claude', 'settings.json'), 'utf8') === settingsWas, noKeyPost.status);
+  const restartsBefore = restartsAsked;
+  const noKeyRestart = await fetch(`${BASE}/api/restart`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: BASE }, body: '{}' });
+  await new Promise((r) => setTimeout(r, 50));
+  check('and so is a restart', noKeyRestart.status === 403 && restartsAsked === restartsBefore, `${noKeyRestart.status}`);
+  // wrong keys: another launch's, one character off, a prefix, and one longer
+  const wrongKeys = [serverModule.newToken(), TOKEN.slice(0, -1) + (TOKEN.endsWith('A') ? 'B' : 'A'), TOKEN.slice(0, 10), TOKEN + 'x', TOKEN + TOKEN];
+  const wrongStatuses = [];
+  for (const k of wrongKeys) wrongStatuses.push(await rawStatus({ ...local, 'X-Dashboard-Token': k }, false));
+  check('a wrong key is refused, whatever its length', wrongStatuses.every((st) => st === 403), JSON.stringify(wrongStatuses));
+  check('the right key is accepted', (await rawStatus({ ...local, 'X-Dashboard-Token': TOKEN }, false)) === 200);
+  // the page itself has to load without the key, or there is nothing to put it in
+  const staticStatuses = [];
+  for (const p2 of ['/', '/app.js', '/index.html']) staticStatuses.push((await fetch(BASE + p2)).status);
+  check('the page\'s own files are served without the key', staticStatuses.every((st) => st === 200), JSON.stringify(staticStatuses));
+  let threw = false;
+  try { serverModule.createServer(PROJECT, PORT, {}); } catch { threw = true; }
+  check('there is no way to build a server without a key', threw);
+
+  // a restart hands the key to the replacement in its environment, never its arguments
+  const cmd = serverModule.restartCommand(TOKEN, [process.execPath, '/x/bin/cli.js', '--port', '9'], { HOME, PATH: process.env.PATH });
+  check('a restart passes the key in the environment, not on the command line',
+    cmd.options.env[serverModule.TOKEN_ENV] === TOKEN && !cmd.args.some((a) => a.includes(TOKEN)) &&
+    cmd.args.includes('--no-open') && cmd.args[0] === '/x/bin/cli.js' && cmd.options.env.HOME === HOME,
+    JSON.stringify(cmd.args));
+  const env = { [serverModule.TOKEN_ENV]: TOKEN, OTHER: '1' };
+  check('the replacement takes the key and leaves none in its environment for what it starts',
+    serverModule.takeTokenFromEnv(env) === TOKEN && !(serverModule.TOKEN_ENV in env) && env.OTHER === '1', JSON.stringify(env));
+  const junk = { [serverModule.TOKEN_ENV]: 'short' };
+  check('and a value that is not a key it made is ignored', serverModule.takeTokenFromEnv(junk) === null && !(serverModule.TOKEN_ENV in junk));
+  const asked = await post('/api/restart', {});
+  await new Promise((r) => setTimeout(r, 50));
+  check('the restart endpoint hands this launch\'s key on to the restart', asked.status === 200 && restartHandedToken === TOKEN, String(restartHandedToken));
+}
+
+// The real thing, end to end: the command line, a restart through the API, and
+// the same key still working on the replacement.
+{
+  const { spawn } = await import('node:child_process');
+  const cliPort = await new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const cli = spawn(process.execPath, [new URL('../bin/cli.js', import.meta.url).pathname, '--path', PROJECT, '--port', String(cliPort), '--no-open'], {
+    env: { ...process.env, [serverModule.TOKEN_ENV]: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  cli.stdout.on('data', (d) => { out += d; });
+  cli.stderr.on('data', (d) => { out += d; });
+  const waitFor = async (test, ms = 10000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (await test()) return true;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
+  };
+  const urlRe = new RegExp(`http://localhost:${cliPort}/#token=([A-Za-z0-9_-]{43})`);
+  await waitFor(() => urlRe.test(out));
+  const key = (out.match(urlRe) || [])[1];
+  check('the command line prints the whole address, key included', !!key, out);
+  const cliBase = `http://127.0.0.1:${cliPort}`;
+  const meta = async (k) => {
+    try {
+      const r = await fetch(`${cliBase}/api/projects`, { headers: { 'X-Dashboard-Token': k || '' } });
+      return { status: r.status, body: await r.json() };
+    } catch {
+      return { status: 0 };
+    }
+  };
+  if (key) {
+    const first = await meta(key);
+    check('and that key opens its API', first.status === 200, JSON.stringify(first));
+    // the desktop launcher has no terminal to read the key from, so it is left
+    // in a file only this user can read
+    const keyFile = serverModule.tokenFilePath(cliPort, HOME);
+    const keyFileOk = () => {
+      try {
+        return fs.readFileSync(keyFile, 'utf8').trim() === key && (fs.statSync(keyFile).mode & 0o777) === 0o600;
+      } catch {
+        return false;
+      }
+    };
+    check('the command line leaves its key in a file only this user can read', keyFileOk(),
+      fs.existsSync(keyFile) ? (fs.statSync(keyFile).mode & 0o777).toString(8) : 'missing');
+    check('in a folder only this user can open', (fs.statSync(path.dirname(keyFile)).mode & 0o777) === 0o700);
+    check('with no temporary file left beside it', fs.readdirSync(path.dirname(keyFile)).filter((n) => n.endsWith('.tmp')).length === 0,
+      fs.readdirSync(path.dirname(keyFile)).join(','));
+    const r = await fetch(`${cliBase}/api/restart`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dashboard-Token': key }, body: '{}' });
+    check('a restart through the API is accepted', r.status === 200, r.status);
+    let after = null;
+    const cameBack = await waitFor(async () => {
+      after = await meta(key);
+      return after.status === 200 && after.body.startedAt > first.body.startedAt;
+    }, 20000);
+    check('the replacement answers the same key the tab already holds', cameBack, JSON.stringify(after));
+    // the process that handed over is still alive, waiting; it must not have
+    // taken the file away from the replacement
+    check('and the key file survives the handover, still holding that key', keyFileOk(),
+      fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8') : 'missing');
+    // a stop during a restart reaches the replacement, which removes the file;
+    // checked below once both have gone
+    const printedAgain = [...out.matchAll(new RegExp(urlRe, 'g'))].map((m) => m[1]);
+    check('and prints the same address again', printedAgain.length === 2 && printedAgain[1] === key, JSON.stringify(printedAgain));
+    check('while a different key is still refused', (await meta(serverModule.newToken())).status === 403);
+  }
+  cli.kill('SIGTERM');
+  await new Promise((r) => (cli.exitCode !== null || cli.signalCode ? r() : cli.on('exit', r)));
+  check('stopping the command line stops the replacement too',
+    await waitFor(async () => (await meta(key)).status === 0, 5000));
+  check('and the key file goes with them', !fs.existsSync(serverModule.tokenFilePath(cliPort, HOME)));
+}
+
+// A dashboard stopped with Ctrl+C (no restart in between) removes its key
+// file; and a file that holds some other key is left alone.
+{
+  const { spawn } = await import('node:child_process');
+  const p = await new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const cli = spawn(process.execPath, [new URL('../bin/cli.js', import.meta.url).pathname, '--path', PROJECT, '--port', String(p), '--no-open'], {
+    env: { ...process.env, [serverModule.TOKEN_ENV]: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  cli.stdout.on('data', (d) => { out += d; });
+  const keyFile = serverModule.tokenFilePath(p, HOME);
+  // The file can land before the printed address reaches this end of the
+  // pipe, so wait for both.
+  for (let i = 0; i < 100 && !(fs.existsSync(keyFile) && out.includes('#token=')); i++) await new Promise((r) => setTimeout(r, 100));
+  const written = fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8').trim() : null;
+  check('the key in the file is the key in the printed address', !!written && out.includes(`#token=${written}`), out);
+  cli.kill('SIGINT');
+  const code = await new Promise((r) => (cli.exitCode !== null ? r(cli.exitCode) : cli.on('exit', (c) => r(c))));
+  check('Ctrl+C removes the key file', !fs.existsSync(keyFile), String(code));
+  check('and ends with the code a shell gives Ctrl+C', code === 130, String(code));
+
+  const other = serverModule.newToken();
+  serverModule.writeTokenFile(p, other, HOME);
+  serverModule.removeTokenFile(p, serverModule.newToken(), HOME);
+  check('a key file holding some other key is not removed', fs.readFileSync(keyFile, 'utf8').trim() === other);
+  serverModule.removeTokenFile(p, other, HOME);
+  check('and one holding its own is', !fs.existsSync(keyFile));
+}
+
+// The macOS desktop launcher, bin/open-dashboard.sh, run with stand-ins for
+// `open` and `osascript` that only record what they were given. It hardcodes
+// port 4317 unless CLAUDE_DASHBOARD_PORT says otherwise.
+if (process.platform !== 'win32' && fs.existsSync('/bin/bash') && spawnSyncOk('curl', ['--version'])) {
+  const { spawn, spawnSync } = await import('node:child_process');
+  const freePort = () => new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const L = path.join(SANDBOX, 'launcher');
+  const fakeBin = path.join(L, 'bin');
+  const rec = path.join(L, 'rec');
+  const tmp = path.join(L, 'tmp');
+  for (const d of [fakeBin, rec, tmp]) fs.mkdirSync(d, { recursive: true });
+  for (const name of ['open', 'osascript']) {
+    fs.writeFileSync(path.join(fakeBin, name), `#!/bin/bash\nfor a in "$@"; do printf '%s\\n' "$a"; done >> "${rec}/${name}.args"\n`, { mode: 0o755 });
+  }
+  const recorded = (name) => { try { return fs.readFileSync(path.join(rec, `${name}.args`), 'utf8'); } catch { return ''; } };
+  const clearRecords = () => { for (const n of fs.readdirSync(rec)) fs.rmSync(path.join(rec, n)); };
+  const script = new URL('../bin/open-dashboard.sh', import.meta.url).pathname;
+  const target = path.join(SANDBOX, 'my proj');
+  fs.mkdirSync(target, { recursive: true });
+  const launch = (port) => spawnSync('/bin/bash', [script, target], {
+    env: {
+      HOME, TMPDIR: tmp, CLAUDE_DASHBOARD_PORT: String(port),
+      PATH: `${fakeBin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+    },
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  const expectedPage = (port, key) =>
+    `location.replace("http://localhost:${port}/?path=${encodeURIComponent(target)}#token=${key}")`;
+  const openedPage = () => {
+    const arg = recorded('open').trim();
+    try {
+      return { arg, mode: fs.statSync(arg).mode & 0o777, text: fs.readFileSync(arg, 'utf8') };
+    } catch {
+      return { arg };
+    }
+  };
+
+  // a dashboard already running, started from the command line
+  const p1 = await freePort();
+  const cli = spawn(process.execPath, [new URL('../bin/cli.js', import.meta.url).pathname, '--path', PROJECT, '--port', String(p1), '--no-open'], {
+    env: { ...process.env, [serverModule.TOKEN_ENV]: '' },
+    stdio: 'ignore',
+  });
+  const keyFile1 = serverModule.tokenFilePath(p1, HOME);
+  for (let i = 0; i < 100 && !fs.existsSync(keyFile1); i++) await new Promise((r) => setTimeout(r, 100));
+  const key1 = fs.existsSync(keyFile1) ? fs.readFileSync(keyFile1, 'utf8').trim() : '';
+  let r = launch(p1);
+  let page = openedPage();
+  check('the launcher reuses a running dashboard and opens it with that dashboard\'s key, keeping ?path=',
+    r.status === 0 && page.text?.includes(expectedPage(p1, key1)) && !recorded('osascript'),
+    `${r.status} ${r.stderr} ${JSON.stringify(page)} ${recorded('osascript')}`);
+  check('through a page only this user can read, so the key is not on `open`\'s command line',
+    page.mode === 0o600 && path.basename(page.arg) === 'open.html' && !page.arg.includes(key1) &&
+    (fs.statSync(path.dirname(page.arg)).mode & 0o777) === 0o700, JSON.stringify(page));
+
+  // a key file left behind that the running dashboard does not take
+  clearRecords();
+  const stale = serverModule.newToken();
+  serverModule.writeTokenFile(p1, stale, HOME);
+  r = launch(p1);
+  check('a key the running dashboard refuses is reported, not opened',
+    r.status === 1 && /did not accept the key/.test(recorded('osascript')) && /did not accept the key/.test(r.stderr) && !recorded('open'),
+    `${r.status} ${r.stderr} ${recorded('osascript')} ${recorded('open')}`);
+  cli.kill('SIGTERM');
+  await new Promise((res) => (cli.exitCode !== null ? res() : cli.on('exit', res)));
+  check('and that file, holding a key that is not the dashboard\'s own, outlives it', fs.existsSync(keyFile1) &&
+    fs.readFileSync(keyFile1, 'utf8').trim() === stale);
+
+  // nothing running, and a key file left by a dashboard that crashed: the
+  // launcher starts one itself and opens it with the new key
+  clearRecords();
+  r = launch(p1);
+  const key2 = fs.existsSync(keyFile1) ? fs.readFileSync(keyFile1, 'utf8').trim() : '';
+  page = openedPage();
+  check('with nothing running, the launcher starts a dashboard and opens it with the new key, not the stale one',
+    r.status === 0 && key2 && key2 !== stale && page.text?.includes(expectedPage(p1, key2)),
+    `${r.status} ${r.stderr} ${JSON.stringify(page)} ${recorded('osascript')}`);
+  const log = path.join(HOME, '.claude-context-dashboard', 'run', `server-${p1}.log`);
+  check('its output, which holds the key, goes to a log only this user can read',
+    fs.existsSync(log) && (fs.statSync(log).mode & 0o777) === 0o600, fs.existsSync(log) ? (fs.statSync(log).mode & 0o777).toString(8) : 'missing');
+  // stop the server the launcher started (it is not a child of this process)
+  spawnSync('pkill', ['-TERM', '-f', '--', `--port ${p1} --no-open`]);
+  let gone = false;
+  for (let i = 0; i < 50 && !gone; i++) {
+    await new Promise((res) => setTimeout(res, 100));
+    gone = !fs.existsSync(keyFile1);
+  }
+  check('and that dashboard, stopped, takes its key file with it', gone);
+
+  // a port nothing answers on, with no way to start one there: the launcher's
+  // server fails, and that is said
+  clearRecords();
+  // (in a process of its own: the launcher runs synchronously, so a socket
+  // held by this one would never be answered)
+  const p2 = await freePort();
+  const busy = spawn(process.execPath, ['-e',
+    `require('net').createServer((s) => s.destroy()).listen(${p2}, '127.0.0.1', () => console.log('up'))`], { stdio: ['ignore', 'pipe', 'ignore'] });
+  await new Promise((res) => busy.stdout.once('data', res));
+  r = launch(p2);
+  check('a port held by something that is not the dashboard is reported, not opened',
+    r.status === 1 && /did not start/.test(recorded('osascript')) && !recorded('open'), `${r.status} ${r.stderr} ${recorded('osascript')}`);
+  busy.kill();
+} else {
+  console.log('  (launcher checks skipped: needs bash and curl)');
+}
 
 // --- what the scan finds at all -------------------------------------------
 // Both of these were found by review: the scan looked for memory under a folder
@@ -1349,6 +1678,461 @@ check('a subagent file that is a symlink is listed', !!linkedAgent, JSON.stringi
 check('and its description is read through the link, so it counts towards the weight',
   linkedAgent?.description === 'lives in another repo' && linkedAgent?.startupBytes > 0, JSON.stringify(linkedAgent));
 check('and the row says where the link really points', linkedAgent?.symlink === realAgent, linkedAgent?.symlink);
+
+// --- review fixes: write paths ------------------------------------------
+// Each of these was proven wrong by review, with a script that showed it.
+{
+  const backupsDir = path.join(HOME, '.claude-context-dashboard', 'backups');
+  const readFile = async (p2, project = PROJECT) =>
+    (await get(`/api/file?path=${encodeURIComponent(p2)}&project=${encodeURIComponent(project)}`)).body;
+  const versionsOf = async (p2, project = PROJECT) =>
+    (await get(`/api/file/backups?path=${encodeURIComponent(p2)}&project=${encodeURIComponent(project)}`)).body;
+  const saveTo = async (p2, content, project = PROJECT) => {
+    const now = await readFile(p2, project);
+    return post('/api/file/save', { filePath: p2, projectPath: project, content, expectedMtimeMs: now.mtimeMs });
+  };
+  const STAMP = /\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.bak$/;
+
+  // A request body arrives in pieces, and a character can straddle two of them:
+  // decoding each piece on its own turned a few of a long file's "—" into U+FFFD.
+  {
+    // two- and three-byte characters back to back, long enough to arrive in
+    // many pieces, so some piece boundary always falls inside one
+    const long = 'é'.repeat(300000) + '\n' + Array.from({ length: 20000 }, (_, i) => `line ${i} — some prose here, é ok`).join('\n') + '\n';
+    res = await saveTo(projectMd, long);
+    const back = fs.readFileSync(projectMd, 'utf8');
+    check('a long save full of characters wider than a byte comes back exactly as sent',
+      res.status === 200 && back === long, `${res.status} replacement chars: ${(back.match(/�/g) || []).length}`);
+    w(projectMd, '# project rules\n');
+  }
+
+  // Two files whose paths differ only in "/" against "__" were given the same
+  // name for their copies, so one file's versions were offered, and put back,
+  // as the other's.
+  const C = path.join(SANDBOX, 'collide');
+  const A = path.join(C, 'a', 'b', 'CLAUDE.md');
+  const B = path.join(C, 'a__b', 'CLAUDE.md');
+  w(A, 'SECRET A original\n');
+  w(B, 'B original\n');
+  {
+    res = await saveTo(A, 'A v2\n', path.join(C, 'a'));
+    check('(the first of two look-alike paths is saved)', res.status === 200, JSON.stringify(res.body));
+    const forB = await versionsOf(B, C);
+    check('a file is not offered the versions of a different file whose path looks the same once flattened',
+      Array.isArray(forB.versions) && forB.versions.length === 0, JSON.stringify(forB.versions));
+    const forA = await versionsOf(A, path.join(C, 'a'));
+    check('and the file that was saved still has its own',
+      forA.versions?.length === 1, JSON.stringify(forA.versions));
+  }
+
+  // A path holding a line break: the old shape of a copy's name could not be
+  // matched across it, so its copies were made and then never seen again.
+  {
+    const NL = path.join(C, 'line\nbreak', 'CLAUDE.md');
+    w(NL, '# odd folder\n');
+    const nlInv = await inventory(C);
+    if (nlInv.claudeMd.nested.some((f) => f.path === NL)) {
+      res = await saveTo(NL, '# changed\n', C);
+      const list = await versionsOf(NL, C);
+      check('a file whose path holds a line break lists the version its save kept',
+        res.status === 200 && list.versions?.length === 1, `${res.status} ${JSON.stringify(list.versions)}`);
+    } else {
+      check('(a folder with a line break in its name is listed, so its versions can be checked)', false,
+        JSON.stringify(nlInv.claudeMd.nested.map((f) => f.path)));
+    }
+    fs.rmSync(path.dirname(NL), { recursive: true, force: true });
+  }
+
+  // Copies made under the old names are still on disk. Which file one came from
+  // cannot be known — guessing from what exists now handed a deleted file's
+  // history to the survivor for good — so they are never renamed: shown, marked,
+  // to a file whose old-style name is exactly theirs, to compare and not put back.
+  {
+    const legacy = (p2, stamp) => path.join(backupsDir, `${p2.replace(/[\\/]/g, '__')}.${stamp}.bak`);
+    const SOLO = path.join(C, 'solo', 'CLAUDE.md');
+    w(SOLO, '# solo now\n');
+    const soloOld = legacy(SOLO, '2020-01-01T00-00-00-000Z');
+    w(soloOld, '# solo, as it was in 2020\n');
+    w(legacy(SOLO + '.disabled', '2020-01-03T00-00-00-000Z'), 'the switched-off twin\n');
+    const shared = legacy(A, '2020-01-02T00-00-00-000Z'); // A and B both flatten to this
+    w(shared, 'whose is this?\n');
+
+    const solo = await versionsOf(SOLO, C);
+    const v = solo.versions?.[0];
+    const kept = v ? (await get(`/api/file/backups?path=${encodeURIComponent(SOLO)}&project=${encodeURIComponent(C)}&id=${encodeURIComponent(v.id)}`)).body : {};
+    check('a copy kept under the old kind of name is listed for the file whose old name is exactly its own, and can be read',
+      solo.versions?.length === 1 && kept.content === '# solo, as it was in 2020\n', JSON.stringify(solo.versions));
+    check('marked as possibly another file\'s, and not to be put back',
+      v?.legacy === true && v?.restorable === false && /may belong to another file/.test(v?.note || '') && solo.restorable === true,
+      JSON.stringify(v));
+    check('and it is left under its old name: listing renames nothing',
+      fs.existsSync(soloOld) && v?.id === path.basename(soloOld), JSON.stringify(fs.readdirSync(backupsDir)));
+    res = await post('/api/file/restore', { filePath: SOLO, projectPath: C, id: v?.id, expectedMtimeMs: fs.statSync(SOLO).mtimeMs });
+    check('putting it back is refused, saying why, and the file is untouched',
+      res.status === 400 && /before backup names changed/.test(res.body.error || '') && fs.readFileSync(SOLO, 'utf8') === '# solo now\n',
+      `${res.status} ${JSON.stringify(res.body)}`);
+
+    // the case that made renaming wrong: the look-alike file is gone, and
+    // the one still there must not come to own its history
+    const forA = await versionsOf(A, path.join(C, 'a'));
+    const forB = await versionsOf(B, C);
+    const oldOf = (list) => list.versions.filter((x) => x.legacy).map((x) => x.id);
+    check('an old name two files could own is shown to both, marked, and restorable for neither',
+      JSON.stringify(oldOf(forA)) === JSON.stringify([path.basename(shared)]) &&
+      JSON.stringify(oldOf(forB)) === JSON.stringify([path.basename(shared)]) &&
+      [...forA.versions, ...forB.versions].every((x) => x.legacy ? x.restorable === false : x.restorable === true) &&
+      forA.versions[0] && !forA.versions[0].legacy,
+      JSON.stringify([forA.versions, forB.versions]));
+    const bWas = fs.readFileSync(B, 'utf8');
+    fs.rmSync(path.dirname(B), { recursive: true, force: true });
+    await versionsOf(A, path.join(C, 'a'));
+    check('and with one of them deleted, it is still not handed to the other',
+      fs.existsSync(shared) && fs.readdirSync(backupsDir).filter((n) => n.includes('CLAUDE.md') && n.startsWith('%') && n.includes('2020-01-02')).length === 0,
+      JSON.stringify(fs.readdirSync(backupsDir)));
+    w(B, bWas);
+    res = await post('/api/file/restore', {
+      filePath: B, projectPath: C, id: path.basename(shared), expectedMtimeMs: fs.statSync(B).mtimeMs,
+    });
+    check('nor can it be put back into either of them by naming it',
+      res.status === 400 && fs.readFileSync(B, 'utf8') === 'B original\n', `${res.status} ${JSON.stringify(res.body)}`);
+
+    // pruned as a file of its own: the old copies never cost a file its newest
+    for (let i = 0; i < 24; i++) w(legacy(SOLO, `2020-02-${String(i + 1).padStart(2, '0')}T00-00-00-000Z`), 'x'.repeat(5000));
+    process.env.CLAUDE_DASHBOARD_BACKUP_BUDGET = String(30000);
+    res = await saveTo(SOLO, '# solo, saved\n', C);
+    delete process.env.CLAUDE_DASHBOARD_BACKUP_BUDGET;
+    const after = (await versionsOf(SOLO, C)).versions;
+    const olds = after.filter((x) => x.legacy);
+    check('old-style copies are pruned as their own group, and the newest new-style copy survives the budget',
+      res.status === 200 && after[0] && !after[0].legacy && after[0].restorable === true &&
+      olds.length >= 1 && olds.length <= 20 && olds.some((x) => x.id.includes('2020-02-24')),
+      `${res.status} ${after.length} ${olds.length} ${JSON.stringify(after[0])}`);
+  }
+
+  // A path too deep to spell out in a copy's name: the spelled-out form is
+  // longer than the old one, so a save that used to work failed on the copy.
+  {
+    let deep = C;
+    while (Buffer.byteLength(path.join(deep, 'CLAUDE.md').replace(/[\\/]/g, '__')) + 29 < 245) deep = path.join(deep, 'abcd');
+    const DEEP = path.join(deep, 'CLAUDE.md');
+    const TWIN = path.join(deep, 'abcd', 'CLAUDE.md'); // the same tail, a different file
+    w(DEEP, '# deep\n');
+    w(TWIN, '# twin\n');
+    res = await saveTo(DEEP, '# deep, saved\n', deep);
+    const list = await versionsOf(DEEP, deep);
+    const id = list.versions?.[0]?.id || '';
+    check('a file too deep to spell out in a copy\'s name still saves, and lists the copy it kept',
+      res.status === 200 && list.versions?.length === 1 && Buffer.byteLength(id) <= 200 && id.endsWith(STAMP.exec(id)?.[0] || '!') &&
+      fs.readFileSync(path.join(backupsDir, id), 'utf8') === '# deep\n', `${res.status} ${JSON.stringify(res.body)} ${id}`);
+    res = await saveTo(TWIN, '# twin, saved\n', deep);
+    const twin = await versionsOf(TWIN, deep);
+    check('and a different deep file gets copies of its own, not the first one\'s',
+      res.status === 200 && twin.versions?.length === 1 && twin.versions[0].id !== id &&
+      (await versionsOf(DEEP, deep)).versions.length === 1, JSON.stringify([id, twin.versions]));
+    res = await post('/api/file/restore', { filePath: TWIN, projectPath: deep, id, expectedMtimeMs: fs.statSync(TWIN).mtimeMs });
+    check('nor can the first one\'s copy be put back into it',
+      res.status === 400 && fs.readFileSync(TWIN, 'utf8') === '# twin, saved\n', `${res.status} ${JSON.stringify(res.body)}`);
+    fs.rmSync(path.join(C, 'abcd'), { recursive: true, force: true });
+  }
+
+  // A copy that cannot be made fails the write before the file is touched.
+  {
+    const realCopy = fs.copyFileSync;
+    fs.copyFileSync = () => { throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }); };
+    const was = fs.readFileSync(projectMd, 'utf8');
+    res = await saveTo(projectMd, '# not without a copy\n');
+    fs.copyFileSync = realCopy;
+    check('a write whose copy cannot be taken is refused with the reason, and the file is untouched',
+      res.status >= 400 && /Could not keep a copy/.test(res.body.error || '') && /ENOSPC/.test(res.body.error || '') &&
+      fs.readFileSync(projectMd, 'utf8') === was && !fs.readdirSync(PROJECT).some((n) => n.includes('.tmp-')),
+      `${res.status} ${JSON.stringify(res.body)}`);
+  }
+
+  // A version goes back byte for byte: reading it as text first turned a file
+  // that is not UTF-8 into replacement characters.
+  {
+    const original = Buffer.from('caf\xe9 r\xe9sum\xe9\r\n', 'latin1');
+    fs.writeFileSync(projectMd, original);
+    res = await post('/api/file/save', {
+      filePath: projectMd, projectPath: PROJECT, content: '# new\n', expectedMtimeMs: fs.statSync(projectMd).mtimeMs,
+    });
+    const id = (await versionsOf(projectMd)).versions[0].id;
+    res = await post('/api/file/restore', { filePath: projectMd, projectPath: PROJECT, id, expectedMtimeMs: fs.statSync(projectMd).mtimeMs });
+    check('putting back a version of a file that is not UTF-8 restores the same bytes',
+      res.status === 200 && fs.readFileSync(projectMd).equals(original), fs.readFileSync(projectMd).toString('hex'));
+    w(projectMd, '# project rules\n');
+  }
+
+  // Something else writing the file while its copy is being taken: the rename
+  // used to go ahead and throw that write away.
+  {
+    const realCopy = fs.copyFileSync;
+    const theirs = '# written by a Claude Code session in the meantime\n';
+    fs.copyFileSync = (from, to, ...rest) => {
+      const r = realCopy(from, to, ...rest);
+      if (String(from) === projectMd) realWrite(projectMd, theirs);
+      return r;
+    };
+    res = await saveTo(projectMd, '# mine\n');
+    fs.copyFileSync = realCopy;
+    check('a write that lands while the copy is being taken is not thrown away',
+      res.status === 409 && fs.readFileSync(projectMd, 'utf8') === theirs, `${res.status} ${JSON.stringify(res.body)}`);
+    check('and the temporary file is cleared up',
+      !fs.readdirSync(PROJECT).some((n) => n.includes('.tmp-')), JSON.stringify(fs.readdirSync(PROJECT)));
+    w(projectMd, '# project rules\n');
+  }
+
+  // Over the total, space comes back from the file using the most of it: going
+  // oldest-first across every file let one big file wipe out the others' history.
+  {
+    fs.rmSync(backupsDir, { recursive: true, force: true });
+    for (let i = 0; i < 4; i++) await saveTo(projectMd, `# small ${i}\n`);
+    const big = (i) => JSON.stringify({ pad: 'x'.repeat(40000), i }) + '\n';
+    for (let i = 0; i < 6; i++) await saveTo(PROJECT_SETTINGS, big(i));
+    process.env.CLAUDE_DASHBOARD_BACKUP_BUDGET = String(3 * 41000);
+    await saveTo(PROJECT_SETTINGS, big(6));
+    delete process.env.CLAUDE_DASHBOARD_BACKUP_BUDGET;
+    const small = (await versionsOf(projectMd)).versions;
+    const bigOnes = (await versionsOf(PROJECT_SETTINGS)).versions;
+    check('a budget that bites takes from the file using the most space, not every file\'s oldest',
+      small.length === 4 && bigOnes.length >= 1 && bigOnes.length < 7, `small ${small.length}, big ${bigOnes.length}`);
+    w(projectMd, '# project rules\n');
+    w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
+  }
+
+  // A key holding the wrong kind of value was replaced, so what it held was lost.
+  {
+    w(PROJECT_SETTINGS, JSON.stringify({ permissions: { allow: 'Bash(ls:*)' } }, null, 2));
+    const was = fs.readFileSync(PROJECT_SETTINGS, 'utf8');
+    res = await post('/api/file/permission', {
+      filePath: PROJECT_SETTINGS, projectPath: PROJECT, group: 'allow', rule: 'Bash(cat:*)', action: 'add',
+    });
+    check('adding a rule to a group that is not a list is refused, and the file is left alone',
+      res.status === 400 && /permissions\.allow/.test(res.body.error || '') && fs.readFileSync(PROJECT_SETTINGS, 'utf8') === was,
+      `${res.status} ${JSON.stringify(res.body)}`);
+    w(PROJECT_SETTINGS, JSON.stringify({ permissions: [] }, null, 2));
+    res = await post('/api/file/permission', {
+      filePath: PROJECT_SETTINGS, projectPath: PROJECT, group: 'deny', rule: 'Bash(rm:*)', action: 'add',
+    });
+    check('and so is adding one where "permissions" itself is not a set of groups',
+      res.status === 400 && Array.isArray(readJson(PROJECT_SETTINGS).permissions), `${res.status} ${JSON.stringify(res.body)}`);
+    w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
+
+    const claudeJson = path.join(HOME, '.claude.json');
+    const keptJson = fs.readFileSync(claudeJson, 'utf8');
+    const proj = fs.realpathSync(PROJECT);
+    const d = JSON.parse(keptJson);
+    d.mcpServers = { roamer: { command: 'roam' } };
+    d.projects = { ...(d.projects || {}), [proj]: { ...(d.projects?.[proj] || {}), mcpServers: 'oops' } };
+    w(claudeJson, JSON.stringify(d, null, 2));
+    const before = fs.readFileSync(claudeJson, 'utf8');
+    res = await post('/api/mcp/move', { name: 'roamer', to: 'project', projectPath: PROJECT });
+    check('moving a connection into a list that is not a set of entries is refused, and it is not lost',
+      res.status === 400 && fs.readFileSync(claudeJson, 'utf8') === before, `${res.status} ${JSON.stringify(res.body)}`);
+    w(claudeJson, JSON.stringify({ ...JSON.parse(keptJson), mcpServers: [{ name: 'listed' }] }, null, 2));
+    const asList = fs.readFileSync(claudeJson, 'utf8');
+    res = await post('/api/toggle/mcp-user', { name: 'listed', enabled: false });
+    check('switching off a connection where "mcpServers" is a list is refused, not reported as done',
+      res.status === 400 && /mcpServers/.test(res.body.error || '') && fs.readFileSync(claudeJson, 'utf8') === asList,
+      `${res.status} ${JSON.stringify(res.body)}`);
+    w(claudeJson, keptJson);
+    fs.chmodSync(claudeJson, 0o600);
+  }
+
+  // A project whose .claude folder is a link to the global one: a switch that
+  // says "this project" wrote the settings every project reads.
+  {
+    const REPO = path.join(SANDBOX, 'repo-linked-claude');
+    w(path.join(REPO, 'CLAUDE.md'), '# cloned\n');
+    fs.symlinkSync(path.join(HOME, '.claude'), path.join(REPO, '.claude'));
+    const globalWas = fs.readFileSync(GLOBAL_SETTINGS, 'utf8');
+    res = await post('/api/toggle/plugin', { projectPath: REPO, key: 'demo@market', enabled: false, scope: 'project' });
+    check('a "this project" switch through a linked .claude folder is refused, and the global file untouched',
+      res.status === 400 && /every project reads/.test(res.body.error || '') && fs.readFileSync(GLOBAL_SETTINGS, 'utf8') === globalWas,
+      `${res.status} ${JSON.stringify(res.body)}`);
+    res = await post('/api/toggle/plugin', { projectPath: REPO, key: 'demo@market', clear: true, scope: 'project' });
+    check('and so is clearing a project override through it',
+      res.status === 400 && fs.readFileSync(GLOBAL_SETTINGS, 'utf8') === globalWas, `${res.status} ${JSON.stringify(res.body)}`);
+    const globalSkill = path.join(HOME, '.claude', 'skills', 'tidy', 'SKILL.md');
+    refused = null;
+    try {
+      toggle.toggleFile({ filePath: path.join(REPO, '.claude', 'skills', 'tidy', 'SKILL.md'), enabled: false, projectPath: REPO });
+    } catch (err) { refused = err; }
+    check('and a "project" skill that is really a global one is not switched off',
+      refused?.statusCode === 400 && fs.existsSync(globalSkill), refused?.message);
+    fs.rmSync(REPO, { recursive: true, force: true });
+
+    // the file itself being a link: still fine into a dotfiles repo, refused into ~/.claude
+    const P3 = path.join(SANDBOX, 'linked-file-proj');
+    w(path.join(P3, 'CLAUDE.md'), '# p3\n');
+    fs.mkdirSync(path.join(P3, '.claude'), { recursive: true });
+    const P3S = path.join(P3, '.claude', 'settings.json');
+    fs.symlinkSync(GLOBAL_SETTINGS, P3S);
+    res = await post('/api/toggle/plugin', { projectPath: P3, key: 'demo@market', enabled: false, scope: 'project' });
+    check('a project settings file that is a link to the global one is refused too',
+      res.status === 400 && fs.readFileSync(GLOBAL_SETTINGS, 'utf8') === globalWas, `${res.status} ${JSON.stringify(res.body)}`);
+    fs.unlinkSync(P3S);
+    const p3Dotfile = path.join(HOME, 'dotfiles', 'p3-settings.json');
+    w(p3Dotfile, JSON.stringify({}, null, 2));
+    fs.symlinkSync(p3Dotfile, P3S);
+    res = await post('/api/toggle/plugin', { projectPath: P3, key: 'demo@market', enabled: false, scope: 'project' });
+    check('but one linked into a dotfiles repo is still written through, and stays a link',
+      res.status === 200 && readJson(p3Dotfile).enabledPlugins?.['demo@market'] === false && fs.lstatSync(P3S).isSymbolicLink(),
+      `${res.status} ${JSON.stringify(res.body)}`);
+    fs.rmSync(P3, { recursive: true, force: true });
+
+    // the editor: a subfolder that is a link out of the project
+    const OUT = path.join(SANDBOX, 'outside-target');
+    w(path.join(OUT, 'CLAUDE.md'), '# lives outside\n');
+    const P4 = path.join(SANDBOX, 'linked-sub-proj');
+    w(path.join(P4, 'CLAUDE.md'), '# p4\n');
+    fs.symlinkSync(OUT, path.join(P4, 'pkg'));
+    const linkedMd = path.join(P4, 'pkg', 'CLAUDE.md');
+    const opened = await readFile(linkedMd, P4);
+    check('a file in a folder that links out of the project opens read-only, saying why',
+      opened.writable === false && /outside this project/.test(opened.readOnlyReason || ''), JSON.stringify(opened).slice(0, 240));
+    res = await post('/api/file/save', { filePath: linkedMd, projectPath: P4, content: 'PWNED\n', expectedMtimeMs: opened.mtimeMs });
+    check('and saving it is refused, leaving the file it really is alone',
+      res.status === 400 && fs.readFileSync(path.join(OUT, 'CLAUDE.md'), 'utf8') === '# lives outside\n',
+      `${res.status} ${JSON.stringify(res.body)}`);
+    // the same project named through a link of its own: the paths the page
+    // sends are built from where the project really is, not from that name
+    const P4_ALIAS = path.join(SANDBOX, 'linked-sub-alias');
+    fs.symlinkSync(P4, P4_ALIAS);
+    res = await post('/api/file/save', { filePath: linkedMd, projectPath: P4_ALIAS, content: 'PWNED\n', expectedMtimeMs: opened.mtimeMs });
+    check('and so is a save naming the project through a link',
+      res.status === 400 && /outside this project/.test(res.body.error || '') &&
+      fs.readFileSync(path.join(OUT, 'CLAUDE.md'), 'utf8') === '# lives outside\n', `${res.status} ${JSON.stringify(res.body)}`);
+    fs.unlinkSync(P4_ALIAS);
+    fs.rmSync(P4, { recursive: true, force: true });
+
+    // A skill or subagent folder linked in from elsewhere is how one is shared:
+    // the row says a switch or a save changes it where it really lives, and so
+    // it must — refusing made both buttons fail. Into ~/.claude stays refused.
+    const P7 = path.join(SANDBOX, 'linked-skill-proj');
+    const SHARED = path.join(SANDBOX, 'shared-skills', 'roam');
+    w(path.join(P7, 'CLAUDE.md'), '# p7\n');
+    w(path.join(SHARED, 'SKILL.md'), '---\nname: roam\ndescription: shared\n---\nbody\n');
+    fs.mkdirSync(path.join(P7, '.claude', 'skills'), { recursive: true });
+    fs.symlinkSync(SHARED, path.join(P7, '.claude', 'skills', 'roam'));
+    fs.symlinkSync(path.join(HOME, '.claude', 'skills', 'tidy'), path.join(P7, '.claude', 'skills', 'tidy'));
+    const p7Skills = (await inventory(P7)).skills;
+    const roam = p7Skills.find((x) => x.name === 'roam' && x.scope === 'project');
+    const shownRoam = await readFile(roam?.path || '', P7);
+    res = await post('/api/file/save', { filePath: roam?.path, projectPath: P7, content: '---\nname: roam\ndescription: edited\n---\n', expectedMtimeMs: shownRoam.mtimeMs });
+    check('a project skill folder linked in from outside the project opens writable and saves where it really lives',
+      !!roam?.symlink && shownRoam.writable === true && res.status === 200 && /edited/.test(fs.readFileSync(path.join(SHARED, 'SKILL.md'), 'utf8')),
+      `${res.status} ${JSON.stringify(res.body)} ${JSON.stringify(shownRoam).slice(0, 200)}`);
+    res = await post('/api/toggle/file', { filePath: roam?.path, projectPath: P7, enabled: false });
+    check('and switching it off renames the file where it really lives',
+      res.status === 200 && fs.existsSync(path.join(SHARED, 'SKILL.md.disabled')) && !fs.existsSync(path.join(SHARED, 'SKILL.md')),
+      `${res.status} ${JSON.stringify(res.body)}`);
+    const tidyRow = p7Skills.find((x) => x.name === 'tidy' && x.scope === 'project');
+    res = await post('/api/toggle/file', { filePath: tidyRow?.path, projectPath: P7, enabled: false });
+    check('but one linked into the global .claude folder is still refused, and the global skill stays on',
+      !!tidyRow && res.status === 400 && /every project reads/.test(res.body.error || '') && fs.existsSync(globalSkill),
+      `${res.status} ${JSON.stringify(res.body)}`);
+    fs.rmSync(P7, { recursive: true, force: true });
+    fs.rmSync(path.dirname(SHARED), { recursive: true, force: true });
+  }
+
+  // Answers say what kind of "no" they are.
+  {
+    const now = await readFile(projectMd);
+    await post('/api/file/save', { filePath: projectMd, projectPath: PROJECT, content: '# one\n', expectedMtimeMs: now.mtimeMs });
+    res = await post('/api/file/save', { filePath: projectMd, projectPath: PROJECT, content: '# two\n', expectedMtimeMs: now.mtimeMs });
+    check('a save against a file that changed meanwhile is a conflict (409)', res.status === 409, `${res.status} ${JSON.stringify(res.body)}`);
+    res = await post('/api/file/permission', { filePath: PROJECT_SETTINGS, projectPath: PROJECT, group: 'nonsense', rule: 'x', action: 'add' });
+    check('a request that makes no sense is a bad request (400), not a server failure', res.status === 400, `${res.status}`);
+    res = await post('/api/file/save', { filePath: path.join(HOME, 'nothing-to-see'), projectPath: PROJECT, content: 'x', expectedMtimeMs: null });
+    check('and so is asking for a file the dashboard is not showing', res.status === 400, `${res.status}`);
+    w(projectMd, '# project rules\n');
+  }
+
+  // The checks below are each the only thing that notices if one line goes.
+  {
+    // the content-type rule on its own, with a body that is valid JSON
+    const settingsWas = fs.readFileSync(PROJECT_SETTINGS, 'utf8');
+    const plain = await fetch(BASE + '/api/toggle/plugin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain', Origin: BASE, ...T },
+      body: JSON.stringify({ projectPath: PROJECT, key: 'demo@market', enabled: false, scope: 'project' }),
+    });
+    check('a switch sent as plain text is refused even when the body is valid JSON',
+      plain.status === 400 && fs.readFileSync(PROJECT_SETTINGS, 'utf8') === settingsWas, `${plain.status}`);
+
+    // permissions carried over, past the umask
+    const oldMask = process.umask(0o022);
+    fs.chmodSync(PROJECT_SETTINGS, 0o664);
+    res = await post('/api/toggle/plugin', { projectPath: PROJECT, key: 'demo@market', enabled: false, scope: 'project' });
+    check('a written file keeps permissions the umask would otherwise strip',
+      res.status === 200 && (fs.statSync(PROJECT_SETTINGS).mode & 0o777) === 0o664, (fs.statSync(PROJECT_SETTINGS).mode & 0o777).toString(8));
+    w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
+
+    const fresh = path.join(PROJECT, '.claude', 'settings.local.json');
+    fs.rmSync(fresh, { force: true });
+    res = await post('/api/file/save', { filePath: fresh, projectPath: PROJECT, content: '{}\n', expectedMtimeMs: null });
+    check('a file created here is readable by you alone',
+      res.status === 200 && (fs.statSync(fresh).mode & 0o777) === 0o600, (fs.statSync(fresh).mode & 0o777).toString(8));
+    fs.rmSync(fresh, { force: true });
+
+    // a backup folder left open by an older version is locked down by the next write
+    const dash = path.dirname(backupsDir);
+    fs.rmSync(backupsDir, { recursive: true, force: true });
+    fs.chmodSync(dash, 0o755);
+    fs.mkdirSync(backupsDir, { mode: 0o755 });
+    fs.chmodSync(backupsDir, 0o755);
+    res = await saveTo(projectMd, '# locks the folder\n');
+    check('a backup folder that was left open is made private again',
+      res.status === 200 && (fs.statSync(dash).mode & 0o777) === 0o700 && (fs.statSync(backupsDir).mode & 0o777) === 0o700,
+      `${(fs.statSync(dash).mode & 0o777).toString(8)} / ${(fs.statSync(backupsDir).mode & 0o777).toString(8)}`);
+    // and one made fresh is private from the start, even when it cannot be chmodded
+    fs.rmSync(backupsDir, { recursive: true, force: true });
+    const realChmod2 = fs.chmodSync;
+    fs.chmodSync = (p2, m) => {
+      if (String(p2).includes('.claude-context-dashboard')) throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+      return realChmod2(p2, m);
+    };
+    res = await saveTo(projectMd, '# a fresh folder\n');
+    fs.chmodSync = realChmod2;
+    check('a backup folder is created private, not only made so afterwards',
+      res.status === 200 && (fs.statSync(backupsDir).mode & 0o777) === 0o700, (fs.statSync(backupsDir).mode & 0o777).toString(8));
+    process.umask(oldMask);
+    w(projectMd, '# project rules\n');
+
+    // a plugin's file reached by an "@" line is on the editable list, which is
+    // why the plugin-cache refusal is there at all
+    const P5 = path.join(SANDBOX, 'imports-plugin');
+    const spec = '~/' + path.relative(HOME, pluginSkill).split(path.sep).join('/');
+    w(path.join(P5, 'CLAUDE.md'), `# p5\n@${spec}\n`);
+    const pluginText = fs.readFileSync(pluginSkill, 'utf8');
+    const viaImport = await readFile(pluginSkill, P5);
+    check('a plugin\'s file pulled in by an @ line opens read-only, and says it is the plugin\'s',
+      viaImport.writable === false && /belongs to a plugin/.test(viaImport.readOnlyReason || ''), JSON.stringify(viaImport).slice(0, 240));
+    res = await post('/api/file/save', { filePath: pluginSkill, projectPath: P5, content: 'changed\n', expectedMtimeMs: viaImport.mtimeMs });
+    check('and saving it is refused',
+      res.status === 400 && /belongs to a plugin/.test(res.body.error || '') && fs.readFileSync(pluginSkill, 'utf8') === pluginText,
+      `${res.status} ${JSON.stringify(res.body)}`);
+    fs.rmSync(P5, { recursive: true, force: true });
+
+    // an "@" line reaching out of the project and the global .claude folder
+    const P6 = path.join(SANDBOX, 'imports-outside');
+    const elsewhereDoc = path.join(SANDBOX, 'not-a-project', 'shared-notes.md');
+    w(elsewhereDoc, '# someone else\'s notes\n');
+    w(path.join(P6, 'CLAUDE.md'), `# p6\n@${elsewhereDoc}\n`);
+    const outsideRead = await readFile(elsewhereDoc, P6);
+    check('a file an @ line pulls in from outside the project opens read-only, and says that is why',
+      outsideRead.writable === false && /outside this project/.test(outsideRead.readOnlyReason || '') &&
+      !/not showing/.test(outsideRead.readOnlyReason || ''), JSON.stringify(outsideRead).slice(0, 240));
+    res = await post('/api/file/save', { filePath: elsewhereDoc, projectPath: P6, content: 'x\n', expectedMtimeMs: outsideRead.mtimeMs });
+    check('and its save is refused for that same reason',
+      res.status === 400 && /outside this project/.test(res.body.error || '') &&
+      fs.readFileSync(elsewhereDoc, 'utf8') === '# someone else\'s notes\n', `${res.status} ${JSON.stringify(res.body)}`);
+    fs.rmSync(P6, { recursive: true, force: true });
+    fs.rmSync(path.dirname(elsewhereDoc), { recursive: true, force: true });
+  }
+  fs.rmSync(C, { recursive: true, force: true });
+}
 
 server.close();
 if (failures) {

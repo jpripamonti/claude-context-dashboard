@@ -12,23 +12,26 @@
       <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 2 17 6v8l-7 4-7-4V6l7-4Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M10 2v8m0 8v-8m0 0L3 6m7 4 7-4" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
       <h1>Claude context dashboard</h1>
     </div>
-    <div class="project-picker">
-      <input id="project-path" type="text" spellcheck="false" />
-      <button id="load-btn">Load</button>
-      <select id="known-projects"><option value="">Recent projects…</option></select>
-    </div>
+    <form id="project-form" class="project-picker" role="search" aria-label="Choose a project">
+      <input id="project-path" type="text" spellcheck="false" aria-label="Project folder" />
+      <button id="load-btn" type="submit">Load</button>
+      <select id="known-projects" aria-label="Recent projects"><option value="">Recent projects…</option></select>
+    </form>
     <div id="generated-at" class="muted"></div>
   </header>
 
   <div id="layout">
     <nav id="side-nav" aria-label="Sections"></nav>
-    <main id="content">
-      <p class="muted">Loading…</p>
+    <main id="main">
+      <div id="status-line" class="status-line" role="status" aria-live="polite"></div>
+      <div id="content">
+        <p class="muted">Loading…</p>
+      </div>
     </main>
   </div>
 
   <div id="editor" hidden>
-    <div class="editor-panel" role="dialog" aria-label="Edit file">
+    <div class="editor-panel" role="dialog" aria-modal="true" aria-labelledby="editor-path">
       <div class="editor-head">
         <span id="editor-path"></span>
         <button id="editor-close" class="btn">Close</button>

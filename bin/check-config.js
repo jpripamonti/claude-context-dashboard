@@ -213,7 +213,7 @@ checkSettingsKey('A6', 'enabledPlugins', (v) => {
 
 for (const key of ['enabledMcpjsonServers', 'disabledMcpjsonServers']) {
   checkSettingsKey('A7', key, (v) => {
-    if (!Array.isArray(v)) return `is ${typeOf(v)}, expected an array — the scan iterates it, so the whole page fails, not just this section`;
+    if (!Array.isArray(v)) return `is ${typeOf(v)}, expected an array — the scan will ignore it and show a warning, so this server list will be wrong`;
     if (!allStrings(v)) return 'contains entries that are not strings';
     return null;
   });
@@ -266,7 +266,7 @@ if (isMissing(installedRes)) {
   let unknownScopes = 0;
   let stale = 0;
   for (const [key, list] of entries) {
-    if (!Array.isArray(list)) { problems.push(`${typeOf(list)} where an array of install records was expected — this stops the whole page, not just the plugin list`); continue; }
+    if (!Array.isArray(list)) { problems.push(`${typeOf(list)} where an array of install records was expected — the scan will skip it and show a warning, so that plugin will be missing`); continue; }
     for (const r of list) {
       records++;
       if (!isPlainObject(r)) { problems.push(`a record is ${typeOf(r)}, expected an object`); continue; }

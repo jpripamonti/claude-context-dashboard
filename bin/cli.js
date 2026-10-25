@@ -1,7 +1,9 @@
 #!/usr/bin/env node
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { createServer } from '../src/server.js';
+import { startServer, takeTokenFromEnv, writeTokenFile, removeTokenFile } from '../src/server.js';
 
 const USAGE = `claude-context — dashboard for what Claude Code loads in a project
 
@@ -44,28 +46,65 @@ function fail(message) {
 const args = parseArgs(process.argv.slice(2));
 const projectPath = path.resolve(args.path);
 
-const server = createServer(projectPath, args.port);
+// A restart hands this launch's key over in the environment, so the tab that
+// asked for the restart keeps working; taking it also removes it from this
+// process's environment, so nothing started from here inherits it.
+const handedOver = takeTokenFromEnv();
 
-server.on('error', (err) => {
+startServer({ projectPath, port: args.port, ...(handedOver ? { token: handedOver } : {}) }).then(({ url, port, token }) => {
+  // The desktop launcher (bin/open-dashboard.sh) has no terminal to read the
+  // address from, so the key is also left in a file only this user can read,
+  // and taken away again when this process ends.
+  try {
+    writeTokenFile(port, token);
+    process.on('exit', () => removeTokenFile(port, token));
+  } catch (err) {
+    console.error(`(could not leave the key for the desktop launcher: ${err.message})`);
+  }
+  // Ctrl+C and kill end a process without 'exit' handlers running, which would
+  // leave the key file (and the browser trampoline below) behind; this exits
+  // instead, with the code a shell gives a process the signal ended. A restart
+  // replaces these with handlers that pass the signal on (src/server.js).
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => process.exit(128 + os.constants.signals[signal]));
+
+  console.log(`claude-context-dashboard`);
+  console.log(`  project: ${projectPath}`);
+  console.log(`  url:     ${url}`);
+  console.log(`           (loopback only — not reachable from other machines; the part after # is this launch's key,`);
+  console.log(`            so open the whole address, and do not share it)`);
+  console.log(`  (Ctrl+C to stop)`);
+
+  if (!args.noOpen) openBrowser(url);
+}, (err) => {
   if (err.code === 'EADDRINUSE') {
     fail(`port ${args.port} is already in use — the dashboard may already be running at http://localhost:${args.port}`);
   }
   fail(String(err.message || err));
 });
 
-server.listen(args.port, '127.0.0.1', () => {
-  const url = `http://localhost:${args.port}`;
-  console.log(`claude-context-dashboard`);
-  console.log(`  project: ${projectPath}`);
-  console.log(`  url:     ${url}  (loopback only — not reachable from other machines)`);
-  console.log(`  (Ctrl+C to stop)`);
-
-  if (!args.noOpen) {
-    const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-    try {
-      spawn(opener, [url], { shell: process.platform === 'win32', stdio: 'ignore', detached: true }).unref();
-    } catch {
-      /* opening the browser is a convenience, not required */
-    }
+// The browser is not handed the address itself: whatever is given to the
+// opener sits in its command line, and the browser's if this launches it,
+// where any user on the machine can read it with `ps`. It is handed a file
+// only this user can read, which sends the tab on to the real address.
+function openBrowser(url) {
+  let target = url;
+  try {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-context-'));
+    const file = path.join(dir, 'open.html');
+    const json = JSON.stringify(url).replace(/</g, '\\u003c');
+    fs.writeFileSync(file, `<!doctype html><meta charset="utf-8"><title>claude-context-dashboard</title><script>location.replace(${json})</script>`, { mode: 0o600 });
+    target = file;
+    const cleanUp = () => fs.rmSync(dir, { recursive: true, force: true });
+    // long enough for a browser that has to start first
+    setTimeout(cleanUp, 120000).unref();
+    process.on('exit', cleanUp);
+  } catch {
+    /* no private file to be had: fall back to the address itself */
   }
-});
+  const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+  try {
+    spawn(opener, process.platform === 'win32' ? ['""', `"${target}"`] : [target], { shell: process.platform === 'win32', stdio: 'ignore', detached: true }).unref();
+  } catch {
+    /* opening the browser is a convenience, not required */
+  }
+}
