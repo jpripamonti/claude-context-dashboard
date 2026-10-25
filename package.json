@@ -7,6 +7,15 @@
     "claude-context": "./bin/cli.js"
   },
   "main": "src/server.js",
+  "files": [
+    "bin",
+    "src",
+    "public",
+    "README.md",
+    "LICENSE",
+    "docs/reference.md",
+    "docs/schema-assumptions.md"
+  ],
   "scripts": {
     "test": "node test/write-paths.test.mjs && node test/scan.test.mjs && node test/editor.test.mjs",
     "check": "node bin/check-config.js"

@@ -1,40 +1,33 @@
 # Pending
 
-Known rough edges, none of which lose data. Three rounds of adversarial review
-have been done; everything they found is fixed except the list below.
+Known rough edges and open questions. Nothing here is known to lose data in
+the ordinary case, but the first item is a claim about Claude Code that nobody
+has checked, and the second and third are corners where the backup history can
+be wrong or missing. Review rounds so far have fixed what they found; this is
+what they left, or what the fixes themselves introduced.
 
-## Smaller
+## Unverified against real Claude Code
 
-- [ ] A path containing a newline makes its backups invisible and unprunable:
-      `BACKUP_NAME`'s `(.*)` doesn't match `\n`
-      ([src/toggle.js#L11](src/toggle.js#L11)), so `listBackups` reports none
-      while copies pile up. The check it replaced handled this.
-- [ ] Turning something off for one project takes two clicks: the "this
-      project" switch starts at "follows the global setting", and the first
-      click writes `true` before the second writes `false`. An undecided switch
-      should go to the opposite of what is happening now.
-- [ ] Version rows label `stat().size` as "characters"; it is bytes.
+- [ ] The shared-MCP "this project" switch assumes the higher settings layer
+      wins: a project-level `enabledMcpjsonServers` is taken to beat a global
+      `disabledMcpjsonServers`. Nobody has confirmed that Claude Code merges
+      the two lists that way; it may combine them and let "disabled" win, in
+      which case the switch writes its answer and the server stays off. When
+      the deciding file is a global one, the fallback writes the project's
+      committed `.claude/settings.json`, not `settings.local.json`, so a
+      teammate sees the change too. Needs a check against a real Claude Code
+      session.
 
-- [ ] A malformed `installed_plugins.json` or a non-iterable
-      `enabledMcpjsonServers` takes the whole page down, not just its section:
-      `scanPlugins` calls `records.some(...)` and `sharedMcpState` iterates the
-      key without checking either first. Both are noted in
-      [docs/schema-assumptions.md](docs/schema-assumptions.md) (A7, A10) as
-      damage the page does not contain.
-- [ ] Adding a permission rule to a `permissions.allow` that is not an array
-      replaces it with a fresh array holding only the new rule; the old rules
-      survive only in the backup. Same for a `mcpServers` that is an array:
-      switching a server off assigns a named property that `JSON.stringify`
-      drops, and the definition is gone from the file.
+## Backups
 
-## Tests
-
-- [ ] Nothing checks that the editor panel shows the version limits — deleting
-      the whole `versionLimits ? … : ''` interpolation from `renderVersions`
-      leaves both suites passing. Only the API half is covered.
-- [ ] The two guards in `test/editor.test.mjs` (unknown element id, button not
-      found) `throw`, so the run aborts and the remaining checks never run. They
-      should fail a check and carry on.
-- [ ] Brittle matching in the same file: `knownIds` only finds ids written with
-      double quotes, `buttonsIn` breaks on a literal `>` inside an attribute,
-      and `data-([a-z-]+)` would miss a data attribute containing a digit.
+- [ ] Adopting legacy backups: old `__`-named copies are renamed to the new
+      form only when exactly one file on disk could own the name. If a
+      colliding file was deleted, the survivor is the only candidate and
+      claims all of the old copies, including ones that were really the
+      deleted file's. The versions list can then offer text from a file that
+      is not this one.
+- [ ] Very long paths can exceed the 255-character filename limit for a
+      backup name: the whole path is written into the name, and `%XX`
+      encoding makes it up to three times longer. The write then fails at the
+      copy step, which is safe (nothing is written without a backup) but
+      leaves that file impossible to edit from here.

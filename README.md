@@ -33,7 +33,7 @@ It opens `http://localhost:4317`. You can switch projects from the page itself �
 
 ## What it shows
 
-- **What loads before you type** — how much each thing adds at startup, in characters and rough tokens, biggest first. Tool connections are not counted: measuring the tool list they send would mean connecting to them, which this never does.
+- **What loads before you type** — how much each thing adds at startup, in UTF-8 bytes and rough tokens, biggest first. Tool connections are not counted: measuring the tool list they send would mean connecting to them, which this never does.
 - **Instructions files** — the global `CLAUDE.md`, the project's, the ones in between, and every file their `@` lines pull in, each as a row of its own, including the lines that bring nothing.
 - **Files the instructions point at** — the other kind of pointer, the one written in prose. Claude Code does not load these, so they are listed apart and never counted as weight.
 - **Settings & permissions** — all four settings layers separately, each setting in words instead of raw JSON, permission rules added and removed one at a time.
@@ -44,7 +44,7 @@ It opens `http://localhost:4317`. You can switch projects from the page itself �
 
 Switching a skill, subagent, instructions file or memory note off renames it; nothing in it is touched, and nothing is backed up because nothing is overwritten. A plugin switch writes one of the two shared settings files, global or the project's own, depending on which switch you press. A switch for a server shared through `.mcp.json` writes wherever that decision is currently being made — the row says which file that is — except when that file applies to every project, where it writes the project's own settings instead. A switch labelled "this project" never writes a file that applies to every project. A hook switched off is parked in `~/.claude-context-dashboard/parked.json` rather than left as an unknown key in a settings file.
 
-Every write that replaces content backs the file up first, is atomic, keeps the original permission bits, and is refused if the file changed on disk since it was read (a running Claude Code session may have written it). The editor's **Earlier versions** list puts any backup back.
+Every write that replaces content backs the file up first, is atomic, keeps the original permission bits, and is refused if the file changed on disk since it was read (a running Claude Code session may have written it). A failed write leaves the file as it was. The editor's **Earlier versions** list puts any backup back.
 
 Exactly what each switch does, and everything it refuses to do, is in [docs/reference.md](docs/reference.md).
 
