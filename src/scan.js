@@ -63,7 +63,7 @@ export const MAX_TEXT_BYTES = 2 * 1024 * 1024;
 export const MAX_JSON_BYTES = 16 * 1024 * 1024;
 export const MAX_CLAUDE_JSON_BYTES = 256 * 1024 * 1024;
 
-export function describeSize(bytes) {
+function describeSize(bytes) {
   return bytes >= 1024 * 1024 ? `${Math.round((bytes / (1024 * 1024)) * 10) / 10} MB` : `${Math.ceil(bytes / 1024)} KB`;
 }
 
@@ -205,10 +205,6 @@ function resolveIfSymlink(p) {
   return p;
 }
 
-// Canonicalize a directory path (resolve symlinks) so the same project
-// reached via two different routes (e.g. a symlink) is treated identically —
-// this must be used consistently everywhere a project path is matched
-// against Claude Code's own records (which are also filesystem paths).
 function isDirectory(p) {
   try {
     return fs.statSync(p).isDirectory(); // follows links, unlike readdir's own answer
@@ -217,6 +213,10 @@ function isDirectory(p) {
   }
 }
 
+// Canonicalize a directory path (resolve symlinks) so the same project
+// reached via two different routes (e.g. a symlink) is treated identically —
+// this must be used consistently everywhere a project path is matched
+// against Claude Code's own records (which are also filesystem paths).
 function realpathOrResolve(p) {
   const resolved = path.resolve(p);
   try {
@@ -1438,10 +1438,7 @@ export function buildInventory(projectPathInput) {
 // the dashboard is actually showing it for this project. That keeps the rule
 // easy to state ("you can change what you can see") and means no separate list
 // of path patterns can drift out of step with what the scanner reports.
-export function collectEditablePaths(projectPathInput) {
-  return editablePathsFrom(buildInventory(projectPathInput));
-}
-
+//
 // Takes an inventory that has already been built. Reading one file used to
 // build three of them — several megabytes of ~/.claude.json read three times
 // to answer one question — because each of these helpers started from scratch.
@@ -1481,10 +1478,6 @@ export function editablePathsFrom(inv) {
 // an installed plugin — you should be able to see what a plugin is telling
 // Claude. Writing them is still refused (see assertEditable), because a plugin
 // update would overwrite the change.
-export function collectViewablePaths(projectPathInput) {
-  return viewablePathsFrom(buildInventory(projectPathInput));
-}
-
 export function viewablePathsFrom(inv) {
   const set = editablePathsFrom(inv);
   for (const entry of [...inv.skills, ...inv.agents]) set.add(entry.path);

@@ -1,9 +1,8 @@
 # Pending
 
 Known rough edges and open questions. Nothing here is known to lose data in
-the ordinary case, but the first item is a claim about Claude Code that nobody
-has checked, and the second and third are corners where the backup history can
-be wrong or missing. Review rounds so far have fixed what they found; this is
+the ordinary case, but the item below is a claim about Claude Code that nobody
+has checked. Review rounds so far have fixed what they found; this is
 what they left, or what the fixes themselves introduced.
 
 ## Unverified against real Claude Code

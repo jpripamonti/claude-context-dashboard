@@ -104,7 +104,7 @@ if (isMissing(globalJson)) {
   const g = globalJson.data;
 
   if (g.mcpServers === undefined) absent('A2', 'mcpServers', 'no global MCP servers configured here');
-  else if (!isPlainObject(g.mcpServers)) mismatch('A2', 'mcpServers', `is ${typeOf(g.mcpServers)}, expected an object — switching a server off here can lose its definition`);
+  else if (!isPlainObject(g.mcpServers)) mismatch('A2', 'mcpServers', `is ${typeOf(g.mcpServers)}, expected an object — switching a server off or moving it here is refused`);
   else if (!allObjects(g.mcpServers)) mismatch('A2', 'mcpServers', 'some entries are not objects');
   else ok('A2', 'mcpServers', `${Object.keys(g.mcpServers).length} entries, all objects`);
 
@@ -240,7 +240,7 @@ checkSettingsKey('A9', 'permissions', (v) => {
   if (!isPlainObject(v)) return `is ${typeOf(v)}, expected an object`;
   for (const list of ['allow', 'deny', 'ask']) {
     if (v[list] === undefined) continue;
-    if (!Array.isArray(v[list])) return `${list} is ${typeOf(v[list])}, expected an array — adding a rule would replace what is in it`;
+    if (!Array.isArray(v[list])) return `${list} is ${typeOf(v[list])}, expected an array — adding a rule is refused`;
     if (!allStrings(v[list])) return `${list} contains entries that are not strings`;
   }
   return null;

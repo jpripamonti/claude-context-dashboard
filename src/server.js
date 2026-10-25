@@ -65,7 +65,7 @@ function isSameOrigin(req, port) {
 // terminal that started the dashboard and the tab it opened ever see: it
 // travels in the address's #fragment (never sent to a server, never in a log
 // or a Referer), and the page sends it back in a header.
-export const TOKEN_HEADER = 'x-dashboard-token';
+const TOKEN_HEADER = 'x-dashboard-token';
 // how a restart hands the key to the process that replaces this one: the
 // environment, which only this user can read, rather than the command line,
 // which every user on the machine can see in `ps`

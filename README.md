@@ -112,7 +112,7 @@ The rest are listed in the [reference](docs/reference.md#known-limitations).
 npm test
 ```
 
-Two plain Node scripts, no dependencies, both against a throwaway `HOME`, so your real config is never touched. They cover every write path and drive the editor the way the page does, against a real server and real files.
+Three plain Node scripts, no dependencies, all against a throwaway `HOME`, so your real config is never touched. They cover every write path and drive the editor the way the page does, against a real server and real files.
 
 ## Status
 
