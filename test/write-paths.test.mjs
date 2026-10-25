@@ -2006,32 +2006,148 @@ check('and the row says where the link really points', linkedAgent?.symlink === 
     fs.unlinkSync(P4_ALIAS);
     fs.rmSync(P4, { recursive: true, force: true });
 
-    // A skill or subagent folder linked in from elsewhere is how one is shared:
-    // the row says a switch or a save changes it where it really lives, and so
-    // it must — refusing made both buttons fail. Into ~/.claude stays refused.
+    // A skill or subagent folder linked in from elsewhere is how one is shared,
+    // so a switch or a save changes it where it really lives — refusing made
+    // both buttons fail. But a cloned repo can ship that link pointed at any
+    // folder of yours, so each write or rename out of the project through it
+    // needs a confirmation naming that exact location, checked by the server.
+    // Into ~/.claude stays refused, confirmed or not.
     const P7 = path.join(SANDBOX, 'linked-skill-proj');
     const SHARED = path.join(SANDBOX, 'shared-skills', 'roam');
+    const SHARED_MD = path.join(SHARED, 'SKILL.md');
     w(path.join(P7, 'CLAUDE.md'), '# p7\n');
-    w(path.join(SHARED, 'SKILL.md'), '---\nname: roam\ndescription: shared\n---\nbody\n');
+    w(SHARED_MD, '---\nname: roam\ndescription: shared\n---\nbody\n');
     fs.mkdirSync(path.join(P7, '.claude', 'skills'), { recursive: true });
     fs.symlinkSync(SHARED, path.join(P7, '.claude', 'skills', 'roam'));
     fs.symlinkSync(path.join(HOME, '.claude', 'skills', 'tidy'), path.join(P7, '.claude', 'skills', 'tidy'));
+    // and one whose link stays inside the project: nothing to ask
+    w(path.join(P7, 'vendored', 'near', 'SKILL.md'), '---\nname: near\ndescription: vendored\n---\nbody\n');
+    fs.symlinkSync(path.join('..', '..', 'vendored', 'near'), path.join(P7, '.claude', 'skills', 'near'));
     const p7Skills = (await inventory(P7)).skills;
     const roam = p7Skills.find((x) => x.name === 'roam' && x.scope === 'project');
     const shownRoam = await readFile(roam?.path || '', P7);
-    res = await post('/api/file/save', { filePath: roam?.path, projectPath: P7, content: '---\nname: roam\ndescription: edited\n---\n', expectedMtimeMs: shownRoam.mtimeMs });
-    check('a project skill folder linked in from outside the project opens writable and saves where it really lives',
-      !!roam?.symlink && shownRoam.writable === true && res.status === 200 && /edited/.test(fs.readFileSync(path.join(SHARED, 'SKILL.md'), 'utf8')),
-      `${res.status} ${JSON.stringify(res.body)} ${JSON.stringify(shownRoam).slice(0, 200)}`);
+    check('a project skill folder linked in from outside the project opens writable',
+      !!roam?.symlink && shownRoam.writable === true, JSON.stringify(shownRoam).slice(0, 200));
+    const edit = (confirmLinked) => post('/api/file/save', {
+      filePath: roam?.path, projectPath: P7, content: '---\nname: roam\ndescription: edited\n---\n', expectedMtimeMs: shownRoam.mtimeMs,
+      ...(confirmLinked === undefined ? {} : { confirmLinked }),
+    });
+    const sharedWas = fs.readFileSync(SHARED_MD, 'utf8');
+    res = await edit();
+    check('but saving it unconfirmed is refused as a question (409, confirm-linked) naming where it really lives, and nothing is written',
+      res.status === 409 && res.body.code === 'confirm-linked' && res.body.linkTarget === SHARED_MD &&
+      res.body.error.includes(SHARED_MD) && fs.readFileSync(SHARED_MD, 'utf8') === sharedWas,
+      `${res.status} ${JSON.stringify(res.body)}`);
+    res = await edit(path.join(HOME, 'Documents', 'SKILL.md'));
+    check('a confirmation naming some other location does not let it through',
+      res.status === 409 && res.body.code === 'confirm-linked' && fs.readFileSync(SHARED_MD, 'utf8') === sharedWas,
+      `${res.status} ${JSON.stringify(res.body)}`);
+    res = await edit(roam?.path);
+    check('nor does one naming the path as the page lists it, rather than where it really is',
+      res.status === 409 && fs.readFileSync(SHARED_MD, 'utf8') === sharedWas, `${res.status} ${JSON.stringify(res.body)}`);
+    res = await edit(SHARED_MD);
+    check('confirmed with that exact location, it saves where it really lives',
+      res.status === 200 && /edited/.test(fs.readFileSync(SHARED_MD, 'utf8')), `${res.status} ${JSON.stringify(res.body)}`);
+    // putting the earlier version back writes there too, so it asks the same
+    const roamVersions = (await get(`/api/file/backups?path=${encodeURIComponent(roam?.path || '')}&project=${encodeURIComponent(P7)}`)).body;
+    const restoreBody = { filePath: roam?.path, projectPath: P7, id: roamVersions.versions?.[0]?.id, expectedMtimeMs: fs.statSync(SHARED_MD).mtimeMs };
+    check('its versions are listed as restorable — the question comes when one is put back', roamVersions.restorable === true && roamVersions.versions?.length >= 1,
+      JSON.stringify(roamVersions));
+    res = await post('/api/file/restore', restoreBody);
+    check('putting an earlier version back unconfirmed is refused the same way',
+      res.status === 409 && res.body.code === 'confirm-linked' && res.body.linkTarget === SHARED_MD && /edited/.test(fs.readFileSync(SHARED_MD, 'utf8')),
+      `${res.status} ${JSON.stringify(res.body)}`);
+    res = await post('/api/file/restore', { ...restoreBody, confirmLinked: SHARED_MD });
+    check('and goes through confirmed', res.status === 200 && fs.readFileSync(SHARED_MD, 'utf8') === sharedWas, `${res.status} ${JSON.stringify(res.body)}`);
     res = await post('/api/toggle/file', { filePath: roam?.path, projectPath: P7, enabled: false });
-    check('and switching it off renames the file where it really lives',
-      res.status === 200 && fs.existsSync(path.join(SHARED, 'SKILL.md.disabled')) && !fs.existsSync(path.join(SHARED, 'SKILL.md')),
+    check('switching it off unconfirmed is refused, and the file stays where it is',
+      res.status === 409 && res.body.code === 'confirm-linked' && res.body.linkTarget === SHARED_MD && fs.existsSync(SHARED_MD) && !fs.existsSync(SHARED_MD + '.disabled'),
+      `${res.status} ${JSON.stringify(res.body)}`);
+    res = await post('/api/toggle/file', { filePath: roam?.path, projectPath: P7, enabled: false, confirmLinked: SHARED_MD });
+    check('confirmed, switching it off renames the file where it really lives',
+      res.status === 200 && fs.existsSync(SHARED_MD + '.disabled') && !fs.existsSync(SHARED_MD),
+      `${res.status} ${JSON.stringify(res.body)}`);
+    res = await post('/api/toggle/file', { filePath: roam?.path + '.disabled', projectPath: P7, enabled: true, confirmLinked: SHARED_MD });
+    check('switching it back on asks again, for the file that is there now (the switched-off name)',
+      res.status === 409 && res.body.linkTarget === SHARED_MD + '.disabled' && fs.existsSync(SHARED_MD + '.disabled'),
+      `${res.status} ${JSON.stringify(res.body)}`);
+    res = await post('/api/toggle/file', { filePath: roam?.path + '.disabled', projectPath: P7, enabled: true, confirmLinked: SHARED_MD + '.disabled' });
+    check('and goes through confirmed', res.status === 200 && fs.existsSync(SHARED_MD), `${res.status} ${JSON.stringify(res.body)}`);
+    const near = p7Skills.find((x) => x.name === 'near' && x.scope === 'project');
+    const shownNear = await readFile(near?.path || '', P7);
+    res = await post('/api/file/save', { filePath: near?.path, projectPath: P7, content: '---\nname: near\ndescription: edited\n---\n', expectedMtimeMs: shownNear.mtimeMs });
+    check('a skill folder linked to somewhere else inside the project saves without asking',
+      !!near?.symlink && res.status === 200 && /edited/.test(fs.readFileSync(path.join(P7, 'vendored', 'near', 'SKILL.md'), 'utf8')),
       `${res.status} ${JSON.stringify(res.body)}`);
     const tidyRow = p7Skills.find((x) => x.name === 'tidy' && x.scope === 'project');
-    res = await post('/api/toggle/file', { filePath: tidyRow?.path, projectPath: P7, enabled: false });
-    check('but one linked into the global .claude folder is still refused, and the global skill stays on',
+    res = await post('/api/toggle/file', { filePath: tidyRow?.path, projectPath: P7, enabled: false, confirmLinked: globalSkill });
+    check('but one linked into the global .claude folder is still refused, confirmation or not, and the global skill stays on',
       !!tidyRow && res.status === 400 && /every project reads/.test(res.body.error || '') && fs.existsSync(globalSkill),
       `${res.status} ${JSON.stringify(res.body)}`);
+    // a cloned repo's whole agents folder pointed at a folder of your own
+    const DOCS = path.join(HOME, 'Documents');
+    w(path.join(DOCS, 'diary.md'), 'my private diary\n');
+    fs.symlinkSync(path.join('..', '..', 'home', 'Documents'), path.join(P7, '.claude', 'agents'));
+    const diary = (await inventory(P7)).agents.find((a) => a.path.endsWith(`${path.sep}diary.md`));
+    const shownDiary = await readFile(diary?.path || '', P7);
+    res = await post('/api/file/save', { filePath: diary?.path, projectPath: P7, content: 'overwritten\n', expectedMtimeMs: shownDiary.mtimeMs });
+    const off = await post('/api/toggle/file', { filePath: diary?.path, projectPath: P7, enabled: false });
+    check('a project agents folder linked to a folder of yours: saving and switching off both ask first, naming the real file, and change nothing',
+      !!diary && res.status === 409 && res.body.linkTarget === path.join(DOCS, 'diary.md') && off.status === 409 &&
+      off.body.linkTarget === path.join(DOCS, 'diary.md') && fs.readFileSync(path.join(DOCS, 'diary.md'), 'utf8') === 'my private diary\n' &&
+      !fs.existsSync(path.join(DOCS, 'diary.md.disabled')),
+      `${res.status} ${JSON.stringify(res.body)} ${off.status} ${JSON.stringify(off.body)}`);
+    fs.rmSync(DOCS, { recursive: true, force: true });
+
+    // The global folder under a second spelling that is already "real" — a bind
+    // mount here; on macOS a different case on a disk that ignores case, or
+    // /System/Volumes/Data. Comparing resolved paths as text let a project's
+    // skills folder linked to that spelling overwrite a global skill as "this
+    // project". Making the second spelling needs a bind mount, which needs
+    // root, so that part runs only where it can; the walk itself is checked
+    // below with an injected stat that says the alias is the global folder.
+    const GLOBAL_DIR = path.join(HOME, '.claude');
+    const ALIAS = path.join(SANDBOX, 'alias-of-dot-claude');
+    const fakeStat = (p2) => {
+      if (p2 === ALIAS) return fs.statSync(GLOBAL_DIR);
+      return fs.statSync(p2);
+    };
+    check('the global-folder test goes by what a folder is: a second spelling of it counts, and every folder below it',
+      toggle.isInGlobalFolder(path.join(ALIAS, 'skills', 'tidy', 'SKILL.md'), GLOBAL_DIR, fakeStat) &&
+      toggle.isInGlobalFolder(ALIAS, GLOBAL_DIR, fakeStat) &&
+      toggle.isInGlobalFolder(path.join(GLOBAL_DIR, 'skills'), GLOBAL_DIR) &&
+      !toggle.isInGlobalFolder(path.join(SANDBOX, 'shared-skills'), GLOBAL_DIR, fakeStat) &&
+      !toggle.isInGlobalFolder(path.join(ALIAS, 'x'), GLOBAL_DIR));
+    fs.mkdirSync(ALIAS);
+    let mounted = false;
+    try {
+      childProcess.execFileSync('mount', ['--bind', GLOBAL_DIR, ALIAS], { stdio: 'ignore' });
+      mounted = true;
+    } catch { /* not root, or no mount here */ }
+    if (mounted) {
+      try {
+        const P8 = path.join(SANDBOX, 'alias-skill-proj');
+        w(path.join(P8, 'CLAUDE.md'), '# p8\n');
+        fs.mkdirSync(path.join(P8, '.claude'), { recursive: true });
+        fs.symlinkSync(path.join(ALIAS, 'skills'), path.join(P8, '.claude', 'skills'));
+        const aliasRow = (await inventory(P8)).skills.find((x) => x.name === 'tidy' && x.scope === 'project');
+        const shownAlias = await readFile(aliasRow?.path || '', P8);
+        const globalWasText = fs.readFileSync(globalSkill, 'utf8');
+        res = await post('/api/file/save', {
+          filePath: aliasRow?.path, projectPath: P8, content: 'WRITTEN AS THIS PROJECT\n', expectedMtimeMs: shownAlias.mtimeMs,
+          confirmLinked: path.join(ALIAS, 'skills', 'tidy', 'SKILL.md'),
+        });
+        check('a project skills folder linked to the global folder under a second spelling (bind mount) is refused, confirmed or not',
+          !!aliasRow && res.status === 400 && /every project reads/.test(res.body.error || '') && fs.readFileSync(globalSkill, 'utf8') === globalWasText,
+          `${res.status} ${JSON.stringify(res.body)}`);
+        fs.rmSync(P8, { recursive: true, force: true });
+      } finally {
+        childProcess.execFileSync('umount', [ALIAS], { stdio: 'ignore' });
+      }
+    } else {
+      console.log('note  no bind mount here (needs root): the second-spelling save is checked only through the injected stat above');
+    }
+    fs.rmdirSync(ALIAS);
     fs.rmSync(P7, { recursive: true, force: true });
     fs.rmSync(path.dirname(SHARED), { recursive: true, force: true });
   }

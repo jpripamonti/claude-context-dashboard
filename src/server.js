@@ -336,12 +336,12 @@ export function createServer(defaultProjectPath, port, { onRestart = restartSelf
 
       if (req.method === 'POST' && (pathname.startsWith('/api/toggle/') || pathname.startsWith('/api/file/') || pathname.startsWith('/api/mcp/'))) {
         if (pathname === '/api/file/save') {
-          const { filePath, projectPath, content, expectedMtimeMs } = await readJsonBody(req);
-          return sendJson(res, 200, { ok: true, ...writeEditableFile({ filePath, projectPath, content, expectedMtimeMs }) });
+          const { filePath, projectPath, content, expectedMtimeMs, confirmLinked } = await readJsonBody(req);
+          return sendJson(res, 200, { ok: true, ...writeEditableFile({ filePath, projectPath, content, expectedMtimeMs, confirmLinked }) });
         }
         if (pathname === '/api/file/restore') {
-          const { filePath, projectPath, id, expectedMtimeMs } = await readJsonBody(req);
-          return sendJson(res, 200, { ok: true, ...restoreBackup({ filePath, projectPath, id, expectedMtimeMs }) });
+          const { filePath, projectPath, id, expectedMtimeMs, confirmLinked } = await readJsonBody(req);
+          return sendJson(res, 200, { ok: true, ...restoreBackup({ filePath, projectPath, id, expectedMtimeMs, confirmLinked }) });
         }
         if (pathname === '/api/file/permission') {
           const { filePath, projectPath, group, rule, action } = await readJsonBody(req);
@@ -353,8 +353,8 @@ export function createServer(defaultProjectPath, port, { onRestart = restartSelf
           return sendJson(res, 200, { ok: true, ...togglePlugin({ projectPath, key, enabled, scope }) });
         }
         if (pathname === '/api/toggle/markdown') {
-          const { projectPath, filePath, enabled } = await readJsonBody(req);
-          return sendJson(res, 200, { ok: true, ...toggleMarkdown({ projectPath, filePath, enabled }) });
+          const { projectPath, filePath, enabled, confirmLinked } = await readJsonBody(req);
+          return sendJson(res, 200, { ok: true, ...toggleMarkdown({ projectPath, filePath, enabled, confirmLinked }) });
         }
         if (pathname === '/api/toggle/hook') {
           const { projectPath, settingsPath, event, index, enabled, signature } = await readJsonBody(req);
@@ -384,8 +384,8 @@ export function createServer(defaultProjectPath, port, { onRestart = restartSelf
           return sendJson(res, 200, { ok: true, ...toggleMcpUser({ name, enabled }) });
         }
         if (pathname === '/api/toggle/file') {
-          const { filePath, enabled, projectPath } = await readJsonBody(req);
-          return sendJson(res, 200, { ok: true, ...toggleFile({ filePath, enabled, projectPath }) });
+          const { filePath, enabled, projectPath, confirmLinked } = await readJsonBody(req);
+          return sendJson(res, 200, { ok: true, ...toggleFile({ filePath, enabled, projectPath, confirmLinked }) });
         }
       }
 
@@ -395,7 +395,10 @@ export function createServer(defaultProjectPath, port, { onRestart = restartSelf
 
       return serveStatic(req, res, pathname);
     } catch (err) {
-      return sendJson(res, err.statusCode || 500, { error: String(err.message || err) });
+      // a refusal's details (a code, and what the page needs to ask the question
+      // that would let it through) go with it; nothing else thrown carries any
+      const details = err.details && typeof err.details === 'object' ? err.details : {};
+      return sendJson(res, err.statusCode || 500, { ...details, error: String(err.message || err) });
     }
   });
 }

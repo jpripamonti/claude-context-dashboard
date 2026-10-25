@@ -745,6 +745,64 @@ check('and no link is left pointing at the part that is not there',
   fs.rmSync(path.join(PROJECT, 'docs'), { recursive: true, force: true });
 }
 
+// --- a skill folder that is a link out of the project ---------------------
+// The server refuses a write through it until the request names the file it
+// would change; the page has to ask, in those words, and then send exactly that.
+{
+  const SHARED = path.join(SANDBOX, 'shared-skills', 'roam');
+  const sharedMd = path.join(SHARED, 'SKILL.md');
+  w(sharedMd, '---\nname: roam\ndescription: shared\n---\nbody\n');
+  fs.mkdirSync(path.join(PROJECT, '.claude', 'skills'), { recursive: true });
+  fs.symlinkSync(SHARED, path.join(PROJECT, '.claude', 'skills', 'roam'));
+  const listed = path.join(PROJECT, '.claude', 'skills', 'roam', 'SKILL.md');
+  el('project-path').value = PROJECT;
+  await submitProject();
+  await settle();
+  check('the row of a linked skill folder says a change there is asked about first',
+    /you are asked first, with its location/.test(el('content').innerHTML));
+
+  await openFile(listed);
+  await settle();
+  editorText.value = '---\nname: roam\ndescription: edited here\n---\n';
+  confirmAnswer = false;
+  asked.length = 0;
+  requests.length = 0;
+  await context.saveEditor();
+  const saves = () => requests.filter((r) => r.url === '/api/file/save');
+  check('saving it asks first, naming the file it really changes, outside this project',
+    asked.length === 1 && asked[0] === `This skill folder is a link. Saving changes the file at ${sharedMd}, outside this project. Continue?`,
+    JSON.stringify(asked));
+  check('and saying no sends nothing more, writes nothing, and says it was not saved',
+    saves().length === 1 && !('confirmLinked' in saves()[0].body) && /shared/.test(fs.readFileSync(sharedMd, 'utf8')) &&
+    el('editor-msg').textContent === 'Not saved.',
+    JSON.stringify({ saves: saves().map((r) => r.body.confirmLinked), msg: el('editor-msg').textContent }));
+  confirmAnswer = true;
+  asked.length = 0;
+  requests.length = 0;
+  await context.saveEditor();
+  check('saying yes sends it again with that exact file confirmed, and it is saved there',
+    asked.length === 1 && saves().length === 2 && saves()[1].body.confirmLinked === sharedMd &&
+    /edited here/.test(fs.readFileSync(sharedMd, 'utf8')) && /^Saved/.test(el('editor-msg').textContent),
+    JSON.stringify({ asked, saves: saves().map((r) => r.body.confirmLinked), msg: el('editor-msg').textContent }));
+  await fireClick(el('editor-close'));
+
+  asked.length = 0;
+  requests.length = 0;
+  await clickRendered(el('content'), (d) => d.action === 'toggle-file' && d.path === listed, 'the linked skill\'s switch');
+  await settle();
+  const toggles = requests.filter((r) => r.url === '/api/toggle/file');
+  check('switching it off asks the same way, and goes through confirmed',
+    asked.length === 1 && asked[0] === `This skill folder is a link. Switching it off changes the file at ${sharedMd}, outside this project. Continue?` &&
+    toggles.length === 2 && toggles[1].body.confirmLinked === sharedMd && fs.existsSync(sharedMd + '.disabled'),
+    JSON.stringify({ asked, toggles: toggles.map((r) => r.body) }));
+  fs.unlinkSync(path.join(PROJECT, '.claude', 'skills', 'roam'));
+  fs.rmSync(path.join(PROJECT, '.claude', 'skills'), { recursive: true, force: true });
+  fs.rmSync(path.dirname(SHARED), { recursive: true, force: true });
+  await submitProject();
+  await settle();
+  asked.length = 0;
+}
+
 // --- the comparison itself --------------------------------------------
 const count = (rows, type) => rows.filter((r) => r.type === type).length;
 check('identical text compares as no change',
@@ -837,6 +895,32 @@ check('a key in the address wins over an older one kept for the tab',
   check('a new key with storage refusing does not reload the tab', reloads === reloadsBefore, `${reloads} vs ${reloadsBefore}`);
   check('and the next request carries the new key',
     requests.length >= 1 && requests.every((r) => r.headers['X-Dashboard-Token'] === fresh), JSON.stringify(requests.map((r) => r.headers)));
+}
+
+// a new key arriving re-runs the start of the page; the project switcher must
+// still answer once, and list each recent project once
+{
+  w(path.join(HOME, '.claude.json'), JSON.stringify({ mcpServers: {}, projects: { [OTHER]: {} } }, null, 2));
+  await bootAgain({ hash: `#token=${TOKEN}`, search: '', sessionStorage: broken });
+  const handler = windowHandlers.hashchange[windowHandlers.hashchange.length - 1];
+  lastLocation.hash = `#token=${TOKEN}`;
+  handler();
+  for (let i = 0; i < 50; i++) {
+    await settle();
+    if (requests.filter((r) => r.url.startsWith('/api/inventory')).length >= 2) break;
+  }
+  await settle();
+  const options = [...el('known-projects').innerHTML.matchAll(/<option value="([^"]*)"/g)].map((m) => unescapeHtml(m[1]));
+  check('after a new key arrives, the recent-projects list holds each project once',
+    options.length > 1 && options[0] === '' && new Set(options).size === options.length && options.includes(OTHER),
+    JSON.stringify(options));
+  requests.length = 0;
+  el('project-path').value = OTHER;
+  await submitProject();
+  await settle();
+  const loads = requests.filter((r) => r.url.startsWith('/api/inventory'));
+  check('and loading a project from the path box loads it once, not once per start',
+    loads.length === 1 && loads[0].url === `/api/inventory?path=${encodeURIComponent(OTHER)}`, JSON.stringify(loads.map((r) => r.url)));
 }
 
 server.close();
