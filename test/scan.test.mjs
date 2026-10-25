@@ -333,8 +333,39 @@ if (process.platform !== 'win32' && fs.existsSync('/dev/zero')) {
     editablePathsFrom(globalInv).has(gOnly) && !scan.isOutsideImport(globalInv, gOnly));
   w(path.join(GLOBAL, 'CLAUDE.md'), `# global\n@${chainA}\n`);
   const gChain = buildInventory(P);
-  check('...and so does a chain global -> A -> B, both outside',
-    editablePathsFrom(gChain).has(chainA) && editablePathsFrom(gChain).has(chainB));
+  // A is the user's pick; B is picked by whoever wrote A (a cloned team repo,
+  // say), so B gets the same rule as a file a project's @ line names. This
+  // check used to assert both were editable, which let A's author choose a
+  // file in your home folder for this dashboard to overwrite.
+  check('a chain global -> A -> B, both outside: A stays editable, B is read-only',
+    editablePathsFrom(gChain).has(chainA) && !scan.isOutsideImport(gChain, chainA) &&
+    viewablePathsFrom(gChain).has(chainB) && !editablePathsFrom(gChain).has(chainB) && scan.isOutsideImport(gChain, chainB),
+    JSON.stringify(gChain.claudeMd.files.find((f) => f.label === 'global')?.importedFiles));
+  const bSave = attempt(() => toggle.writeEditableFile({ filePath: chainB, projectPath: P, content: 'pwned\n', expectedMtimeMs: fs.statSync(chainB).mtimeMs }));
+  check('...and saving over B is refused, leaving it alone',
+    !!bSave.error && fs.readFileSync(chainB, 'utf8') === '# b\n', bSave.error ? bSave.error.message : 'saved');
+  // a file really in the global .claude folder is the user's own, under either
+  // spelling of that folder (here it is a link into a dotfiles repo)
+  w(path.join(GLOBAL, 'team.md'), `# team\n@${chainB}\n`);
+  w(path.join(DOTFILES_CLAUDE, 'team2.md'), `# team2\n@${gOnly}\n`);
+  w(path.join(GLOBAL, 'CLAUDE.md'), `# global\n@~/.claude/team.md\n@${path.join(DOTFILES_CLAUDE, 'team2.md')}\n`);
+  const gInside = buildInventory(P);
+  check('a chain global -> a file in the global .claude folder -> B outside: B stays editable, under either spelling of that folder',
+    editablePathsFrom(gInside).has(chainB) && !scan.isOutsideImport(gInside, chainB) &&
+    editablePathsFrom(gInside).has(gOnly) && !scan.isOutsideImport(gInside, gOnly),
+    JSON.stringify(gInside.claudeMd.files.find((f) => f.label === 'global')?.importedFiles));
+  // ...but a file that is only named in that folder, a link out of it, is
+  // judged on where it really is: whoever owns the file it leads to wrote its @ lines
+  fs.rmSync(path.join(GLOBAL, 'team.md'));
+  fs.symlinkSync(chainA, path.join(GLOBAL, 'team.md'));
+  w(path.join(GLOBAL, 'CLAUDE.md'), '# global\n@~/.claude/team.md\n');
+  const gLinked = buildInventory(P);
+  check('a chain global -> a link in the global .claude folder leading out -> B: B is read-only',
+    viewablePathsFrom(gLinked).has(chainB) && !editablePathsFrom(gLinked).has(chainB),
+    JSON.stringify(gLinked.claudeMd.files.find((f) => f.label === 'global')?.importedFiles));
+  fs.rmSync(path.join(GLOBAL, 'team.md'));
+  fs.rmSync(path.join(DOTFILES_CLAUDE, 'team2.md'));
+  w(path.join(GLOBAL, 'CLAUDE.md'), `# global\n@${chainA}\n`);
   const P2 = project({ 'CLAUDE.md': `# p\n@${chainA}\n` });
   w(path.join(GLOBAL, 'CLAUDE.md'), '# global\n');
   const pChain = buildInventory(P2);
@@ -417,6 +448,35 @@ if (process.platform !== 'win32' && fs.existsSync('/dev/zero')) {
   fs.rmSync(P, { recursive: true, force: true });
   fs.rmSync(shared, { recursive: true, force: true });
   fs.rmSync(path.join(GLOBAL, 'skills', 'mine'), { recursive: true, force: true });
+}
+
+// The global-folder test compares folders by what they are on disk. With
+// ~/.claude a link into a dotfiles repo, writes to global files must still go
+// through, and a project folder linked to either spelling must still be refused.
+{
+  const skill = path.join(GLOBAL, 'skills', 'own', 'SKILL.md');
+  w(skill, '---\ndescription: own\n---\nbody\n');
+  w(path.join(GLOBAL, 'CLAUDE.md'), '# global\n');
+  const P = project({ 'CLAUDE.md': '# p\n' });
+  const saved = attempt(() => toggle.writeEditableFile({ filePath: path.join(GLOBAL, 'CLAUDE.md'), projectPath: P, content: '# global, edited\n', expectedMtimeMs: fs.statSync(path.join(GLOBAL, 'CLAUDE.md')).mtimeMs }));
+  const off = attempt(() => toggle.toggleFile({ filePath: skill, projectPath: P, enabled: false }));
+  check('with ~/.claude a link into a dotfiles repo, the global CLAUDE.md saves and a global skill switches off, without being asked anything',
+    !saved.error && fs.readFileSync(path.join(DOTFILES_CLAUDE, 'CLAUDE.md'), 'utf8') === '# global, edited\n' &&
+    !off.error && fs.existsSync(path.join(DOTFILES_CLAUDE, 'skills', 'own', 'SKILL.md.disabled')),
+    `${saved.error?.message} / ${off.error?.message}`);
+  fs.renameSync(skill + '.disabled', skill);
+  for (const target of [path.join(GLOBAL, 'skills'), path.join(DOTFILES_CLAUDE, 'skills')]) {
+    fs.mkdirSync(path.join(P, '.claude'), { recursive: true });
+    fs.symlinkSync(target, path.join(P, '.claude', 'skills'));
+    const asProject = path.join(P, '.claude', 'skills', 'own', 'SKILL.md');
+    const r = attempt(() => toggle.toggleFile({ filePath: asProject, projectPath: P, enabled: false, confirmLinked: path.join(DOTFILES_CLAUDE, 'skills', 'own', 'SKILL.md') }));
+    check(`...while a project skills folder linked to ${target === path.join(GLOBAL, 'skills') ? 'the ~/.claude spelling' : 'the dotfiles spelling'} of it is refused, confirmed or not`,
+      r.error?.statusCode === 400 && /every project reads/.test(r.error.message) && fs.existsSync(skill), r.error?.message || 'switched');
+    fs.unlinkSync(path.join(P, '.claude', 'skills'));
+  }
+  fs.rmSync(P, { recursive: true, force: true });
+  fs.rmSync(path.join(GLOBAL, 'skills', 'own'), { recursive: true, force: true });
+  fs.unlinkSync(path.join(GLOBAL, 'CLAUDE.md'));
 }
 
 fs.rmSync(SANDBOX, { recursive: true, force: true });

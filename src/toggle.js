@@ -10,10 +10,14 @@ const BACKUP_DIR = path.join(os.homedir(), '.claude-context-dashboard', 'backups
 // no longer what the page saw. It carries the answer's status, so the page is
 // told "no" (400) or "changed meanwhile" (409) rather than "the server broke"
 // (500) — which is what anything else thrown still means.
+//
+// A few carry `details` as well — a code and whatever the page needs to ask the
+// question that would let the request through (see confirm-linked below).
 class Refusal extends Error {
-  constructor(message, statusCode = 400) {
+  constructor(message, statusCode = 400, details = null) {
     super(message);
     this.statusCode = statusCode;
+    this.details = details;
   }
 }
 
@@ -440,13 +444,14 @@ function listAt(holder, key, where) {
 
 // A folder's real location, even when the file in it does not exist yet: the
 // nearest part of the path that does exist is resolved, and the rest is put
-// back on the end.
+// back on the end. The native resolver also gives back the case a folder's name
+// really has on a disk that ignores case.
 function realLocation(p) {
   const rest = [];
   let at = path.resolve(p);
   for (;;) {
     try {
-      return path.join(fs.realpathSync(at), ...rest);
+      return path.join(fs.realpathSync.native(at), ...rest);
     } catch {
       const up = path.dirname(at);
       if (up === at) return path.resolve(p);
@@ -458,6 +463,35 @@ function realLocation(p) {
 
 const isWithin = (p, dir) => p === dir || p.startsWith(dir.endsWith(path.sep) ? dir : dir + path.sep);
 
+// Whether a resolved path is the global ~/.claude folder or inside it, judged by
+// which folder it is on disk rather than how its path is spelled. Resolving
+// links is not enough on its own: one folder can have two spellings that are
+// both already "real" — a bind mount, a different case on a disk that ignores
+// case, macOS's /System/Volumes/Data — and a project's skills folder linked to
+// the second spelling would pass a comparison of strings. So every folder the
+// path is in is compared, by device and inode, with the global folder itself.
+// `stat` is there for the suite, which cannot always make a second spelling.
+export function isInGlobalFolder(real, realGlobal = realLocation(paths.GLOBAL_CLAUDE_DIR), stat = fs.statSync) {
+  if (isWithin(real, realGlobal)) return true;
+  let global;
+  try {
+    global = stat(realGlobal);
+  } catch {
+    return false; // no global folder yet: nothing can be inside it
+  }
+  for (let at = path.resolve(real); ; ) {
+    try {
+      const st = stat(at);
+      if (st.dev === global.dev && st.ino === global.ino) return true;
+    } catch {
+      /* not there (yet): the folders above it still count */
+    }
+    const up = path.dirname(at);
+    if (up === at) return false;
+    at = up;
+  }
+}
+
 // A file that is this project's by its name has to be this project's on disk
 // as well. A repository can ship `.claude` as a link to ~/.claude, and then a
 // switch that says "this project" lands in the settings every project reads —
@@ -467,9 +501,14 @@ const isWithin = (p, dir) => p === dir || p.startsWith(dir.endsWith(path.sep) ? 
 //
 // Anywhere else depends on what the file is. A skill or subagent folder linked
 // in from somewhere else — a shared skills repo, a dotfiles checkout — is the
-// ordinary way to share one, the page says on its row that a switch or a save
-// changes the file where it really lives, and that is what happens: the same
-// trade a settings file linked into a dotfiles repo makes (resolveWriteTarget).
+// ordinary way to share one, so a switch or a save there changes the file where
+// it really lives. But a cloned repo can ship that link too, pointed at any
+// folder of yours (`.claude/agents -> ~/Documents`), and then every file in it
+// shows up as one of this project's agents. So a write or a rename that would
+// land outside the project through such a link is refused with the real
+// location named (code "confirm-linked", 409), and goes through only when the
+// request confirms that exact location — the page asks first, in those words.
+// A confirmation names one target, so it cannot authorize any other.
 // Every other project file — its settings, its instructions files — must also
 // really be inside the project: those are what "this project" means, and a
 // folder of a cloned repo linking out of it would let that repo pick the file.
@@ -478,9 +517,12 @@ const isWithin = (p, dir) => p === dir || p.startsWith(dir.endsWith(path.sep) ? 
 // file in the global ~/.claude, which is the same trap one level down. That
 // last part is only for writing into the file: renaming one (switching it
 // off) renames the link itself and never touches what it points at.
+//
+// `probe` is for asking whether a file could be written at all (to show it
+// read-only or not); it skips only the question, never a refusal.
 const LINKABLE_DIRS = ['skills', 'agents'];
 
-function assertStaysInProject(filePath, projectPath, { rename = false } = {}) {
+function assertStaysInProject(filePath, projectPath, { rename = false, confirmLinked = null, probe = false } = {}) {
   const listed = path.resolve(filePath);
   const root = path.resolve(projectPath);
   const dir = path.dirname(listed);
@@ -493,16 +535,28 @@ function assertStaysInProject(filePath, projectPath, { rename = false } = {}) {
   const realGlobal = realLocation(paths.GLOBAL_CLAUDE_DIR);
   const realDir = realLocation(dir);
   const linkable = [root, realRoot].some((r) => LINKABLE_DIRS.some((d) => isWithin(dir, path.join(r, '.claude', d))));
-  if (isWithin(realDir, realGlobal) || (!linkable && !isWithin(realDir, realRoot))) {
-    const where = isWithin(realDir, realGlobal) ? `your global ${paths.GLOBAL_CLAUDE_DIR} folder, which every project reads` : `${realDir}, outside this project`;
+  const dirInGlobal = isInGlobalFolder(realDir, realGlobal);
+  if (dirInGlobal || (!linkable && !isWithin(realDir, realRoot))) {
+    const where = dirInGlobal ? `your global ${paths.GLOBAL_CLAUDE_DIR} folder, which every project reads` : `${realDir}, outside this project`;
     throw new Refusal(
       `${listed} is this project's by its name, but the folder it is in is a link to ${where}. Writing it would change that instead, so it was not written. Change it there directly if that is what you mean.`
     );
   }
   const realFile = realLocation(listed);
-  if (!rename && isWithin(realFile, realGlobal)) {
+  if (!rename && isInGlobalFolder(realFile, realGlobal)) {
     throw new Refusal(
       `${listed} is this project's by its name, but it is a link to ${realFile}, in your global ${paths.GLOBAL_CLAUDE_DIR} folder, which every project reads. Writing it would change that instead, so it was not written.`
+    );
+  }
+  // a rename happens in the folder the file is really in; a write lands in the
+  // file a link points at
+  const target = rename ? path.join(realDir, path.basename(listed)) : realFile;
+  if (linkable && !probe && !isWithin(target, realRoot) && confirmLinked !== target) {
+    throw new Refusal(
+      `${listed} is reached through a link: the file it would change is ${target}, outside this project. Confirm that location to go ahead.`,
+      409,
+      // which link it is, so the question can say so: the folder, or the file in it
+      { code: 'confirm-linked', linkTarget: target, linked: isWithin(realDir, realRoot) ? 'file' : 'folder' }
     );
   }
 }
@@ -746,7 +800,7 @@ export function resolveMcpDuplicate({ scope, projectPath, name, keep }) {
 // inside a plugin's own install cache) are toggled by renaming the file —
 // Claude Code simply won't see a file it doesn't recognize. Restricted to
 // known skill/agent directories, and never overwrites an existing file.
-export function toggleFile({ filePath, enabled, projectPath }) {
+export function toggleFile({ filePath, enabled, projectPath, confirmLinked = null }) {
   assertString(filePath, 'filePath');
   assertBoolean(enabled, 'enabled');
 
@@ -764,7 +818,7 @@ export function toggleFile({ filePath, enabled, projectPath }) {
     throw new Refusal('This file belongs to a plugin. Toggle the plugin instead.');
   }
   // a project's skills folder that is really the global one renames there
-  if (allowedDirs.length > 2) assertStaysInProject(real, projectPath, { rename: true });
+  if (allowedDirs.length > 2) assertStaysInProject(real, projectPath, { rename: true, confirmLinked });
   assertMarkdown(real);
 
   return renameToggle(real, enabled);
@@ -817,7 +871,7 @@ function renameToggle(real, enabled) {
 // naming the target directly would pass the check and get it overwritten. The
 // scanner already reports every path in symlink-resolved form, so an exact
 // comparison is also what the dashboard's own page always sends.
-function assertEditable(filePath, projectPath, inv = null, { rename = false } = {}) {
+function assertEditable(filePath, projectPath, inv = null, { rename = false, confirmLinked = null, probe = false } = {}) {
   assertString(filePath, 'filePath');
   assertDirectory(projectPath, 'projectPath');
   const resolved = path.resolve(filePath);
@@ -842,7 +896,7 @@ function assertEditable(filePath, projectPath, inv = null, { rename = false } = 
     }
     throw new Refusal('Refusing to touch a file this dashboard is not showing for this project.');
   }
-  assertStaysInProject(resolved, projectPath, { rename });
+  assertStaysInProject(resolved, projectPath, { rename, confirmLinked, probe });
   return resolved;
 }
 
@@ -865,7 +919,7 @@ export function readEditableFile({ filePath, projectPath }) {
   let writable = true;
   let readOnlyReason = null;
   try {
-    assertEditable(real, projectPath, inv);
+    assertEditable(real, projectPath, inv, { probe: true });
     if (fs.lstatSync(real).isSymbolicLink()) {
       writable = false;
       readOnlyReason = 'This is a link to another file, so text typed here cannot be saved over it — open the file it points to for that. Switches, and putting an earlier version back, do write through the link.';
@@ -891,14 +945,14 @@ export function readEditableFile({ filePath, projectPath }) {
 // followLink is for putting an earlier version back: that content is this
 // dashboard's own copy of this very file, so writing it through a link is the
 // same thing a switch does. Typed text is not — hence the refusal below.
-export function writeEditableFile({ filePath, projectPath, content, expectedMtimeMs }) {
-  return saveEditable({ filePath, projectPath, content, expectedMtimeMs, followLink: false });
+export function writeEditableFile({ filePath, projectPath, content, expectedMtimeMs, confirmLinked = null }) {
+  return saveEditable({ filePath, projectPath, content, expectedMtimeMs, followLink: false, confirmLinked });
 }
 
 // `content` is typed text (a string) or, for putting a version back, the bytes
 // of the copy (a Buffer), which are written exactly as they were kept.
-function saveEditable({ filePath, projectPath, content, expectedMtimeMs, followLink }) {
-  const real = assertEditable(filePath, projectPath);
+function saveEditable({ filePath, projectPath, content, expectedMtimeMs, followLink, confirmLinked }) {
+  const real = assertEditable(filePath, projectPath, null, { confirmLinked });
   if (typeof content !== 'string' && !(followLink && Buffer.isBuffer(content))) {
     throw new Refusal('content must be a string');
   }
@@ -939,9 +993,9 @@ function saveEditable({ filePath, projectPath, content, expectedMtimeMs, followL
 // CLAUDE.md files and memory notes are switched off the same way skills are:
 // by renaming them. Restricted to markdown so a settings file or .mcp.json
 // can't be renamed out from under Claude Code by accident.
-export function toggleMarkdown({ filePath, projectPath, enabled }) {
+export function toggleMarkdown({ filePath, projectPath, enabled, confirmLinked = null }) {
   assertBoolean(enabled, 'enabled');
-  const real = assertEditable(filePath, projectPath, null, { rename: true });
+  const real = assertEditable(filePath, projectPath, null, { rename: true, confirmLinked });
   assertMarkdown(real);
   return renameToggle(real, enabled);
 }
@@ -1171,7 +1225,7 @@ export function listBackups({ filePath, projectPath }) {
   let names;
   let restorable = true;
   try {
-    assertEditable(real, projectPath, inv);
+    assertEditable(real, projectPath, inv, { probe: true });
   } catch {
     restorable = false; // a plugin's file, or one this project may not write
   }
@@ -1224,11 +1278,11 @@ export function readBackup({ filePath, projectPath, id }) {
 // The copy goes back byte for byte. Reading it as text first turned anything
 // that is not UTF-8 — a file saved as Latin-1, say — into replacement
 // characters, so putting a version back did not put it back.
-export function restoreBackup({ filePath, projectPath, id, expectedMtimeMs }) {
+export function restoreBackup({ filePath, projectPath, id, expectedMtimeMs, confirmLinked = null }) {
   const real = assertViewable(filePath, projectPath);
   const content = fs.readFileSync(backupPathFor(real, id));
   return {
-    ...saveEditable({ filePath: real, projectPath, content, expectedMtimeMs, followLink: true }),
+    ...saveEditable({ filePath: real, projectPath, content, expectedMtimeMs, followLink: true, confirmLinked }),
     restoredFrom: id,
   };
 }

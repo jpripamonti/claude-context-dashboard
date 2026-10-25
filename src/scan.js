@@ -519,12 +519,18 @@ function scanClaudeMd(canonicalProjectPath) {
   // The rule is about a cloned repo choosing the target, so it applies to
   // imports reached from a file in the project or one of its parent folders
   // (a parent folder could itself be a cloned repo that contains the project).
-  // Imports reached from the user's own global CLAUDE.md, chains included
-  // (every row of its importedFiles is reached from it), are the user's own
-  // choice and stay editable wherever they point.
+  // An "@" line in the user's own global CLAUDE.md, or in another file that
+  // really is in the global .claude folder, is the user's own choice and stays
+  // editable wherever it points. A chain does not inherit that: once it passes
+  // through a file outside that folder — a cloned team repo the global
+  // CLAUDE.md pulls in, say — the next "@" line was written by whoever owns
+  // that file, so what it names gets the same rule as one in the project.
+  const globalRoots = [...new Set([GLOBAL_CLAUDE_DIR, realpathOrResolve(GLOBAL_CLAUDE_DIR)])];
+  const writtenByUser = (f, via) =>
+    via === f.path || globalRoots.some((root) => fileIdentity(via).startsWith(root + path.sep));
   for (const f of [...files, ...nested]) {
-    if (f.label === 'global') continue;
     for (const i of f.importedFiles) {
+      if (f.label === 'global' && writtenByUser(f, i.via)) continue;
       if (!i.missing && !i.error && !i.alreadyPulledIn && !isInsideEditableRoots(i.path, canonicalProjectPath)) {
         i.outsideProject = true;
       }

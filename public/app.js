@@ -66,7 +66,10 @@ function withToken(opts) {
 async function fetchJson(url, opts) {
   const res = await fetch(url, withToken(opts));
   const data = await res.json();
-  if (!res.ok || data.error) throw new Error(data.error || `request to ${url} failed`);
+  if (!res.ok || data.error) {
+    // a refusal that is a question (see postAskingAboutLinks) says which one
+    throw Object.assign(new Error(data.error || `request to ${url} failed`), { code: data.code, linkTarget: data.linkTarget, linked: data.linked });
+  }
   return data;
 }
 
@@ -627,7 +630,7 @@ function renderFileList(id, icon, title, list) {
       extra: isPlugin
         ? `<div class="muted">Comes from a plugin, so it can be read here but not changed — switch the plugin off instead.</div>
            <div class="controls">${editButton(s.path, 'Open the whole file')}</div>`
-        : `${s.symlink ? `<div class="muted">This folder is a link to somewhere else, so switching it off or editing it changes the file where it really lives.</div>` : ''}
+        : `${s.symlink ? `<div class="muted">This folder is a link to somewhere else, so switching it off or editing it changes the file where it really lives. When that is outside this project, you are asked first, with its location.</div>` : ''}
           <div class="controls">
             ${switchRow('toggle-file', { path: s.path, scope: s.scope, label: s.name }, !s.disabled)}
             ${editButton(s.path)}
@@ -956,13 +959,16 @@ async function init() {
   const requestedPath = new URLSearchParams(location.search).get('path');
   const startPath = requestedPath || meta.defaultProjectPath;
   document.getElementById('project-path').value = startPath;
+  // filled afresh: init() runs again when a new key arrives (see hashchange)
+  document.getElementById('known-projects').innerHTML = '<option value="">Recent projects…</option>'
+    + meta.known.map((p) => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
+  await loadInventory(startPath);
+}
+
+// Wired once, when the page loads — not in init(), which runs again when a new
+// key arrives, and every extra listener loaded the project once more.
+function wireProjectSwitcher() {
   const select = document.getElementById('known-projects');
-  for (const p of meta.known) {
-    const opt = document.createElement('option');
-    opt.value = p;
-    opt.textContent = p;
-    select.appendChild(opt);
-  }
   select.addEventListener('change', () => {
     if (!select.value || !mayDiscardEdits()) return;
     document.getElementById('project-path').value = select.value;
@@ -973,7 +979,6 @@ async function init() {
     ev.preventDefault();
     switchProject(document.getElementById('project-path').value);
   });
-  await loadInventory(startPath);
 }
 
 // --- editor ------------------------------------------------------------
@@ -1104,12 +1109,16 @@ async function saveEditor() {
   const sent = el('editor-text').value;
   el('editor-msg').textContent = 'Saving…';
   try {
-    const res = await postJson('/api/file/save', {
+    const res = await postAskingAboutLinks('/api/file/save', {
       filePath,
       projectPath,
       content: sent,
       expectedMtimeMs: editorState.mtimeMs,
-    });
+    }, 'Saving');
+    if (!res) {
+      el('editor-msg').textContent = 'Not saved.';
+      return;
+    }
     // pick up the new modification time, so a second save in a row isn't
     // mistaken for someone else having changed the file underneath us
     const fresh = await fetchJson(
@@ -1300,7 +1309,11 @@ async function restoreVersion(id) {
   const { filePath, projectPath } = editorState;
   el('editor-msg').textContent = 'Putting it back…';
   try {
-    await postJson('/api/file/restore', { filePath, projectPath, id, expectedMtimeMs: editorState.mtimeMs });
+    const res = await postAskingAboutLinks('/api/file/restore', { filePath, projectPath, id, expectedMtimeMs: editorState.mtimeMs }, 'Putting it back');
+    if (!res) {
+      el('editor-msg').textContent = 'Not put back.';
+      return;
+    }
     const fresh = await fetchJson(
       `/api/file?path=${encodeURIComponent(filePath)}&project=${encodeURIComponent(projectPath)}`
     );
@@ -1324,6 +1337,23 @@ function postJson(url, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+// A project's skill or subagent folder can be a link to somewhere outside the
+// project — a shared skills repo, or, from a cloned repo, any folder of yours.
+// The server refuses to write or rename through it until asked again with the
+// exact file it would change, so the question names that file. `doing` says
+// what the click does ("Saving", "Switching it off"). Null means the answer was no.
+async function postAskingAboutLinks(url, body, doing) {
+  try {
+    return await postJson(url, body);
+  } catch (err) {
+    if (err.code !== 'confirm-linked' || typeof err.linkTarget !== 'string') throw err;
+    const kind = /[\\/]\.claude[\\/]agents[\\/]/.test(String(body.filePath)) ? 'subagent' : 'skill';
+    const what = err.linked === 'file' ? 'file' : 'folder';
+    if (!confirm(`This ${kind} ${what} is a link. ${doing} changes the file at ${displayPath(err.linkTarget)}, outside this project. Continue?`)) return null;
+    return postJson(url, { ...body, confirmLinked: err.linkTarget });
+  }
 }
 
 // Anything that changes more than the open project asks first — those switches
@@ -1472,14 +1502,16 @@ document.getElementById('content').addEventListener('click', async (ev) => {
       res = await postJson('/api/toggle/mcp-user', { name: btn.dataset.name, enabled: nextEnabled });
     } else if (action === 'toggle-file') {
       if (btn.dataset.scope === 'global' && !confirmGlobal(`"${btn.dataset.label || nameOf(btn.dataset.path)}"`, nextEnabled)) return;
-      res = await postJson('/api/toggle/file', {
+      res = await postAskingAboutLinks('/api/toggle/file', {
         filePath: btn.dataset.path, enabled: nextEnabled, projectPath: currentProjectPath,
-      });
+      }, nextEnabled ? 'Switching it on' : 'Switching it off');
+      if (!res) return;
     } else if (action === 'toggle-markdown') {
       if (btn.dataset.global && !confirmGlobal(`The instructions file ${displayPath(btn.dataset.path)}`, nextEnabled, btn.dataset.global)) return;
-      res = await postJson('/api/toggle/markdown', {
+      res = await postAskingAboutLinks('/api/toggle/markdown', {
         filePath: btn.dataset.path, enabled: nextEnabled, projectPath: currentProjectPath,
-      });
+      }, nextEnabled ? 'Switching it on' : 'Switching it off');
+      if (!res) return;
     } else if (action === 'toggle-hook') {
       if (btn.dataset.global && !confirmGlobal(`The hook "${btn.dataset.label || btn.dataset.event}"`, nextEnabled)) return;
       res = await postJson('/api/toggle/hook', {
@@ -1546,4 +1578,5 @@ window.addEventListener('hashchange', () => {
 });
 
 takeToken();
+wireProjectSwitcher();
 init();
