@@ -1,4 +1,7 @@
 let currentProjectPath = null;
+// The home folder, worked out from the inventory (see homeFrom). Used only to
+// SHOW paths as "~/…": every request still sends the full path it was given.
+let homeDir = null;
 
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({
@@ -11,6 +14,33 @@ async function fetchJson(url, opts) {
   const data = await res.json();
   if (!res.ok || data.error) throw new Error(data.error || `request to ${url} failed`);
   return data;
+}
+
+// The global settings file is always <home>/.claude/settings.json, and the
+// scanner builds it from the same resolved home it builds every other path
+// from — so this is the prefix the page's paths actually carry.
+function homeFrom(data) {
+  const layer = (data && data.settingsLayers || []).find((l) => l.label === 'global');
+  const m = layer && typeof layer.path === 'string' && layer.path.match(/^(.+?)[\\/]\.claude[\\/]settings\.json$/);
+  return m ? m[1] : null;
+}
+
+// Display only. Never pass the result to a request or a data- attribute.
+function displayPath(p) {
+  const s = String(p ?? '');
+  if (!homeDir || !s.startsWith(homeDir)) return s;
+  const rest = s.slice(homeDir.length);
+  if (rest === '') return '~';
+  return rest[0] === '/' || rest[0] === '\\' ? `~${rest}` : s;
+}
+
+// The same, for a sentence that has paths inside it (warnings, reasons,
+// notes): a home path counts only where one starts, not in the middle of a word.
+function displayText(text) {
+  const s = String(text ?? '');
+  if (!homeDir) return s;
+  const escaped = homeDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return s.replace(new RegExp(`(^|[\\s"'(\`])${escaped}(?=[\\\\/])`, 'g'), '$1~');
 }
 
 // --- icons (hand-drawn, monoline, no external assets) -----------------
@@ -39,7 +69,7 @@ function item({ title, badges = [], path: p, desc, extra = '' }) {
   return `<div class="item">
     <div class="item-main">
       <div class="item-title">${escapeHtml(title)} ${badges.join(' ')}</div>
-      ${p ? `<div class="item-path">${escapeHtml(p)}</div>` : ''}
+      ${p ? `<div class="item-path">${escapeHtml(displayText(p))}</div>` : ''}
       ${desc ? `<div class="item-desc">${escapeHtml(desc)}</div>` : ''}
       ${extra}
     </div>
@@ -57,12 +87,18 @@ function dataAttrString(dataAttrs) {
     .join(' ');
 }
 
-// state: true (on) | false (off) | null (undecided — Claude Code hasn't been asked yet)
-function switchRow(action, dataAttrs, state, prefix = '', unsetLabel = 'unset') {
+// state: true (on) | false (off) | null (undecided — nothing at this level says).
+// `effective` is what an undecided switch currently amounts to: a plugin's
+// "this project" switch that follows a global "on" is on in effect, so the
+// first click has to turn it OFF. data-next carries the value a click sends,
+// worked out here where the state is known rather than read back off the
+// button's look, which cannot tell "undecided but on" from "undecided but off".
+function switchRow(action, dataAttrs, state, prefix = '', unsetLabel = 'not decided yet', effective = false) {
   const label = state === null ? unsetLabel : state ? 'on' : 'off';
   const cls = state === null ? 'unset' : state ? 'on' : '';
+  const isOn = state === null ? !!effective : state;
   return `<div class="switch-row">
-    <button class="switch ${cls}" data-action="${action}" ${dataAttrString(dataAttrs)} aria-label="${escapeHtml(prefix || action)}: ${label}"></button>
+    <button class="switch ${cls}" role="switch" aria-checked="${isOn}" data-action="${action}" ${dataAttrString({ ...dataAttrs, next: String(!isOn) })} aria-label="${escapeHtml(prefix || action)}: ${escapeHtml(label)}"></button>
     <span class="switch-label">${prefix ? `${escapeHtml(prefix)} — ` : ''}${label}</span>
   </div>`;
 }
@@ -133,30 +169,37 @@ function describeRule(rule) {
   return TOOL_PHRASES[rule] ? TOOL_PHRASES[rule]('anything') : `Use ${rule}`;
 }
 
-function renderPermissions(permissions, layerPath) {
+// The shapes describeRule reads: a tool name, a tool name with what it applies
+// to in brackets, or an MCP tool. Anything else is still written if you insist —
+// Claude Code's rule syntax grows — but a typo should not go in silently.
+function ruleLooksValid(rule) {
+  return /^mcp__\S+$/.test(rule) || /^[A-Za-z][A-Za-z0-9]*(\(.*\))?$/.test(rule);
+}
+
+function renderPermissions(permissions, layerPath, isGlobal) {
   const groups = PERMISSION_GROUPS.map(({ key, title }) => {
     const rules = Array.isArray(permissions?.[key]) ? permissions[key] : [];
     if (!rules.length) return '';
     const rows = rules.map((rule) => `<div class="rule">
       <div class="rule-text">${escapeHtml(describeRule(rule))}<div class="rule-code">${escapeHtml(rule)}</div></div>
-      ${actionButton('Remove', 'permission-remove', { file: layerPath, group: key, rule })}
+      ${actionButton('Remove', 'permission-remove', { file: layerPath, group: key, rule, global: isGlobal ? '1' : '' })}
     </div>`).join('');
     return `<div class="rule-group"><div class="rule-group-title">${title} <span class="count">${rules.length}</span></div>${rows}</div>`;
   }).join('');
 
   const adder = `<div class="rule-add">
-    <input type="text" class="rule-input" data-for="${escapeHtml(layerPath)}" placeholder="Bash(git push:*)" spellcheck="false" />
-    <select class="rule-group-pick" data-for="${escapeHtml(layerPath)}">
+    <input type="text" class="rule-input" data-for="${escapeHtml(layerPath)}" placeholder="Bash(git push:*)" spellcheck="false" aria-label="New permission rule for ${escapeHtml(displayPath(layerPath))}" />
+    <select class="rule-group-pick" data-for="${escapeHtml(layerPath)}" aria-label="Which list the new rule goes in">
       ${PERMISSION_GROUPS.map((g) => `<option value="${g.key}">${g.title}</option>`).join('')}
     </select>
-    ${actionButton('Add rule', 'permission-add', { file: layerPath })}
+    ${actionButton('Add rule', 'permission-add', { file: layerPath, global: isGlobal ? '1' : '' })}
   </div>`;
 
   return (groups || '<div class="empty">No permission rules in this file.</div>') + adder;
 }
 
-function renderSettingValue(key, value, layerPath) {
-  if (key === 'permissions') return renderPermissions(value, layerPath);
+function renderSettingValue(key, value, layerPath, isGlobal) {
+  if (key === 'permissions') return renderPermissions(value, layerPath, isGlobal);
   if (typeof value === 'boolean') return `<div class="setting-value">${value ? 'yes' : 'no'}</div>`;
   if (typeof value === 'string' || typeof value === 'number') {
     return `<div class="setting-value">${escapeHtml(String(value))}</div>`;
@@ -249,7 +292,7 @@ function importRows(f) {
     const open = i.missing || i.error || i.alreadyPulledIn ? '' : ` ${editButton(i.path, 'Open')}`;
     return `<div class="layer" style="--depth:${i.level - 1}">
       <div class="layer-spec">@${escapeHtml(i.spec)}</div>
-      <div class="layer-path">${escapeHtml(i.path)}</div>
+      <div class="layer-path">${escapeHtml(displayPath(i.path))}</div>
       <div class="layer-note">${state}${open}</div>
     </div>`;
   }).join('');
@@ -270,7 +313,7 @@ function renderClaudeMd(data) {
     path: f.realPath ? `${f.path}  →  ${f.realPath}` : f.path,
     extra: `
       ${importRows(f)}
-      ${f.alsoReachableAs ? `<div class="muted">The same file also loads as ${escapeHtml(f.alsoReachableAs)} — it is one file, listed once.</div>` : ''}
+      ${f.alsoReachableAs ? `<div class="muted">The same file also loads as ${escapeHtml(displayText(f.alsoReachableAs))} — it is one file, listed once.</div>` : ''}
       ${f.realPath ? '<div class="muted">This is a link to another file. It can be switched off here, but to change its text edit the file it points to.</div>' : ''}
       <div class="controls">
         ${switchRow('toggle-markdown', {
@@ -307,7 +350,7 @@ function renderReferences(refs) {
     ],
     path: r.path,
     extra: `
-      <div class="item-desc">Written as "${escapeHtml(r.spec)}" in ${escapeHtml(r.via)}</div>
+      <div class="item-desc">Written as "${escapeHtml(r.spec)}" in ${escapeHtml(displayPath(r.via))}</div>
       <div class="controls">${editButton(r.path, 'Read it')}</div>
     `,
   })).join('');
@@ -329,7 +372,7 @@ function renderSettings(layers) {
       ? keys.map((key) => `<div class="setting">
           <div class="setting-name">${escapeHtml(SETTING_LABELS[key] || key)}
             ${SETTING_LABELS[key] ? `<span class="setting-key">${escapeHtml(key)}</span>` : ''}</div>
-          ${renderSettingValue(key, l.data[key], l.path)}
+          ${renderSettingValue(key, l.data[key], l.path, l.label.startsWith('global'))}
         </div>`).join('')
       : `<div class="empty">${l.exists ? 'This file is empty.' : 'This file does not exist yet.'}</div>`;
 
@@ -371,14 +414,18 @@ function pluginControls(key, states, projectPath, hasOwnSettingsFile) {
   // labelled "this project" would quietly rewrite the global file. Don't offer it.
   if (!hasOwnSettingsFile) {
     return `<div class="controls">
-      ${switchRow('toggle-plugin', { key, project: projectPath, scope: 'global' }, states.global, 'every project', 'not set')}
+      ${switchRow('toggle-plugin', { key, project: projectPath, scope: 'global' }, states.global, 'every project', 'not set — off by default')}
     </div>
     <div class="muted">This folder has no settings file of its own that is separate from the global one, so there is nothing to set for it alone.</div>
     ${localNote}`;
   }
+  // what "follows the global setting" currently amounts to: the layers below
+  // this one, in the order they are applied
+  const inherited = states['global-local'] ?? states.global ?? false;
   return `<div class="controls">
-    ${switchRow('toggle-plugin', { key, project: projectPath, scope: 'global' }, states.global, 'every project', 'not set')}
-    ${switchRow('toggle-plugin', { key, project: projectPath, scope: 'project' }, states.project, 'this project', 'follows the global setting')}
+    ${switchRow('toggle-plugin', { key, project: projectPath, scope: 'global' }, states.global, 'every project', 'not set — off by default')}
+    ${switchRow('toggle-plugin', { key, project: projectPath, scope: 'project' }, states.project, 'this project',
+      `follows the global setting (${inherited ? 'on' : 'off'})`, inherited)}
     ${states.project !== null
       ? actionButton('Follow the global setting again', 'clear-plugin-override', { key, project: projectPath, scope: 'project' })
       : ''}
@@ -482,8 +529,8 @@ function renderMcp(mcp, projectPath) {
   const sharedRows = (mcp.shared.map((s) => item({
     title: s.name,
     badges: [badge('shared via .mcp.json')],
-    desc: `${s.config.url || s.config.command || ''} — ${s.reason}`,
-    extra: switchRow('toggle-mcp-shared', { name: s.name, project: projectPath }, s.enabled),
+    desc: displayText(`${s.config.url || s.config.command || ''} — ${s.reason}`),
+    extra: switchRow('toggle-mcp-shared', { name: s.name, project: projectPath }, s.enabled, '', 'not decided yet — Claude Code asks the first time'),
   })).join('') || '<div class="empty">No .mcp.json in this project.</div>')
     + `<div class="controls">${editButton(
       mcp.mcpJsonPath || `${projectPath}/.mcp.json`,
@@ -528,7 +575,7 @@ function renderFileList(id, icon, title, list) {
            <div class="controls">${editButton(s.path, 'Open the whole file')}</div>`
         : `${s.symlink ? `<div class="muted">This folder is a link to somewhere else, so switching it off or editing it changes the file where it really lives.</div>` : ''}
           <div class="controls">
-            ${switchRow('toggle-file', { path: s.path, scope: s.scope }, !s.disabled)}
+            ${switchRow('toggle-file', { path: s.path, scope: s.scope, label: s.name }, !s.disabled)}
             ${editButton(s.path)}
           </div>`,
     });
@@ -552,6 +599,7 @@ function renderHooks(hooks) {
         ${h.editable
           ? `<div class="controls">${switchRow('toggle-hook', {
               settings: h.source, event: h.event, index, signature: h.signature, global: h.global ? '1' : '',
+              label: `${h.event} — ${h.matcher}`,
             }, h.enabled)}</div>`
           : '<div class="muted">Comes from a plugin — switch the plugin off to stop it.</div>'}
       `,
@@ -578,7 +626,7 @@ function renderMemory(memory) {
 
 function renderWarnings(warnings) {
   if (!warnings.length) return '';
-  const rows = warnings.map((w) => `<div style="margin-bottom:6px"><strong>${escapeHtml(w.path)}</strong><br>${escapeHtml(w.message)}</div>`).join('');
+  const rows = warnings.map((w) => `<div style="margin-bottom:6px"><strong>${escapeHtml(displayPath(w.path))}</strong><br>${escapeHtml(displayText(w.message))}</div>`).join('');
   return `<div class="error-banner">${ICONS.alert}<div>${rows}</div></div>`;
 }
 
@@ -606,7 +654,7 @@ function renderCoverage(coverage) {
   // page) must leave the section out. Drawing an empty one would say the scan
   // looked at nothing, which is the opposite of what this section is for.
   if (!coverage.length) return '';
-  const list = (lines) => `<ul class="coverage-list">${lines.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>`;
+  const list = (lines) => `<ul class="coverage-list">${lines.map((line) => `<li>${escapeHtml(displayText(line))}</li>`).join('')}</ul>`;
   const body = `<div class="coverage-intro muted">Everything on this page comes from the files on the left. The ones on the right are not read, so anything they say is not reflected anywhere above.</div>`
     + coverage.map((group) => `<div class="item">
       <div class="item-main">
@@ -690,7 +738,7 @@ async function restartDashboard(btn) {
   if (refusal) {
     btn.disabled = false;
     btn.textContent = 'Start it again now';
-    alert(refusal);
+    showStatus(refusal, true);
     return;
   }
   const deadline = Date.now() + 60000;
@@ -708,10 +756,11 @@ async function restartDashboard(btn) {
   }
   btn.disabled = false;
   btn.textContent = 'Start it again now';
-  alert('The dashboard did not come back. Start it again from the terminal you launched it in.');
+  showStatus('The dashboard did not come back. Start it again from the terminal you launched it in.', true);
 }
 
 function render(data) {
+  homeDir = homeFrom(data) || homeDir;
   document.getElementById('generated-at').textContent = `generated ${new Date(data.generatedAt).toLocaleString()}`;
   const html = [
     staleWarning(serverMeta),
@@ -737,19 +786,88 @@ function render(data) {
   document.getElementById('side-nav').innerHTML = renderSideNav(data);
 }
 
+// --- the status line: what the last change did --------------------------
+
+function showStatus(message, isError = false) {
+  const line = document.getElementById('status-line');
+  line.textContent = message;
+  if (isError) line.classList.add('error');
+  else line.classList.remove('error');
+}
+
+// Says which file a write landed in and that a copy was kept, in the words of
+// the answer the server gave — not what the page expected to happen.
+// A write answers with a backupPath field (null when the file was new, so
+// there was nothing to copy); an answer without one wrote nothing, or only
+// renamed a file, which keeps no copy because nothing is lost.
+function describeWrite(res) {
+  if (!res || !res.filePath) return 'Done.';
+  const where = displayPath(res.filePath);
+  const note = res.note ? displayText(res.note) : '';
+  if (!('backupPath' in res)) return note ? `${where}: ${note}${/[.!?]$/.test(note) ? '' : '.'}` : `Done — now at ${where}.`;
+  const parts = [`Written to ${where}.`];
+  if (res.backupPath) parts.push('A copy of what it held before was kept — open that file and choose "Earlier versions" to see it or put it back.');
+  if (note) parts.push(note);
+  return parts.join(' ');
+}
+
+// The page a project is shown on stays up until the next one has arrived: a
+// mistyped path says so in the status line instead of replacing a page you
+// were using with an error. Only the first load has nothing to keep.
+let loadSeq = 0;
+// the project the newest load is for: a refresh after a write goes there, so a
+// write finishing while a switch is still loading does not switch back
+let wantedProjectPath = null;
+
+function refreshInventory() {
+  return loadInventory(wantedProjectPath ?? currentProjectPath);
+}
+
 async function loadInventory(projectPath) {
-  currentProjectPath = projectPath;
-  document.getElementById('content').innerHTML = '<p class="muted">Loading…</p>';
-  document.getElementById('side-nav').innerHTML = '';
+  const seq = ++loadSeq;
+  wantedProjectPath = projectPath;
+  const content = document.getElementById('content');
+  content.classList.add('working');
   try {
     const data = await fetchJson(`/api/inventory?path=${encodeURIComponent(projectPath)}`);
+    if (seq !== loadSeq) return false;
+    currentProjectPath = projectPath;
     render(data);
+    rememberPathInAddress(projectPath);
+    return true;
   } catch (err) {
-    // an old server failing to answer the new page is exactly what the stale
-    // banner is about, so it has to survive the failure it warns about
-    document.getElementById('content').innerHTML = staleWarning(serverMeta)
-      + `<div class="error-banner">${ICONS.alert}<div>${escapeHtml(err.message)}</div></div>`;
+    if (seq !== loadSeq) return false;
+    wantedProjectPath = currentProjectPath;
+    if (currentProjectPath === null) {
+      // an old server failing to answer the new page is exactly what the stale
+      // banner is about, so it has to survive the failure it warns about
+      content.innerHTML = staleWarning(serverMeta)
+        + `<div class="error-banner">${ICONS.alert}<div>${escapeHtml(err.message)}</div></div>`;
+    } else {
+      showStatus(`Could not load ${projectPath}: ${err.message}. Still showing ${displayPath(currentProjectPath)}.`, true);
+    }
+    return false;
+  } finally {
+    if (seq === loadSeq) content.classList.remove('working');
   }
+}
+
+// so a reload, or a copied address, comes back to the same project
+function rememberPathInAddress(projectPath) {
+  try {
+    history.replaceState(null, '', `?path=${encodeURIComponent(projectPath)}`);
+  } catch {
+    /* an address that cannot be changed is no reason to fail a load */
+  }
+}
+
+// Switching project on purpose: whatever the last change said is about the
+// old project, so it goes.
+async function switchProject(projectPath, alreadyAsked = false) {
+  if (!alreadyAsked && !mayDiscardEdits()) return;
+  if (!String(projectPath || '').trim()) return;
+  forceCloseEditor();
+  if (await loadInventory(projectPath)) showStatus('');
 }
 
 async function init() {
@@ -766,16 +884,14 @@ async function init() {
     select.appendChild(opt);
   }
   select.addEventListener('change', () => {
-    if (select.value && mayDiscardEdits()) {
-      document.getElementById('project-path').value = select.value;
-      forceCloseEditor();
-      loadInventory(select.value);
-    }
+    if (!select.value || !mayDiscardEdits()) return;
+    document.getElementById('project-path').value = select.value;
+    switchProject(select.value, true);
   });
-  document.getElementById('load-btn').addEventListener('click', () => {
-    if (!mayDiscardEdits()) return;
-    forceCloseEditor();
-    loadInventory(document.getElementById('project-path').value);
+  // a form, so Enter in the path box loads it the same as the button does
+  document.getElementById('project-form').addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    switchProject(document.getElementById('project-path').value);
   });
   await loadInventory(startPath);
 }
@@ -801,16 +917,36 @@ function mayDiscardEdits() {
   return confirm('This file has changes you have not saved. Throw them away?');
 }
 
-async function openEditor(filePath) {
+// The parts of the page behind the editor. Made inert while it is open, so
+// Tab and a screen reader stay inside the dialog, as aria-modal says they do.
+const BEHIND_EDITOR = ['top-bar', 'layout'];
+
+function setBehindEditorInert(inert) {
+  for (const id of BEHIND_EDITOR) {
+    const node = el(id);
+    if (!node) continue;
+    node.inert = inert;
+    if (inert) node.setAttribute?.('aria-hidden', 'true');
+    else node.removeAttribute?.('aria-hidden');
+  }
+}
+
+// which button opened the editor, so closing it can put focus back there
+let editorOpener = null;
+
+async function openEditor(filePath, opener = null) {
   if (!mayDiscardEdits()) return;
   const projectPath = currentProjectPath;
-  el('editor-path').textContent = filePath;
+  if (opener || el('editor').hidden) editorOpener = opener;
+  el('editor-path').textContent = displayPath(filePath);
+  el('editor-path').title = filePath;
   el('editor-text').value = '';
   el('editor-msg').textContent = 'Loading…';
   el('editor-versions').hidden = true;
   el('editor-history').hidden = true;
   el('editor-history').innerHTML = '';
   el('editor').hidden = false;
+  setBehindEditorInert(true);
   try {
     const data = await fetchJson(
       `/api/file?path=${encodeURIComponent(filePath)}&project=${encodeURIComponent(projectPath)}`
@@ -840,7 +976,11 @@ async function openEditor(filePath) {
 
 function closeEditor() {
   if (!mayDiscardEdits()) return;
+  const opener = editorOpener;
   forceCloseEditor();
+  // the page may have been redrawn while the editor was open (a save does
+  // that), so the button is looked up again rather than trusted to still be there
+  focusEquivalent(opener);
 }
 
 // Used where the question has already been asked (switching project), so it
@@ -849,7 +989,29 @@ function forceCloseEditor() {
   el('editor').hidden = true;
   el('editor-history').hidden = true;
   el('editor-history').innerHTML = '';
+  setBehindEditorInert(false);
   editorState = null;
+  editorOpener = null;
+}
+
+// Tab and Shift+Tab go round the dialog's own controls rather than out of it.
+function trapEditorFocus(ev) {
+  const focusables = [...el('editor').querySelectorAll('button, textarea, input, select, [tabindex]')]
+    .filter((n) => !n.hidden && !n.disabled && n.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  if (!focusables.includes(active)) {
+    ev.preventDefault();
+    first.focus();
+  } else if (ev.shiftKey && active === first) {
+    ev.preventDefault();
+    last.focus();
+  } else if (!ev.shiftKey && active === last) {
+    ev.preventDefault();
+    first.focus();
+  }
 }
 
 async function saveEditor() {
@@ -877,11 +1039,14 @@ async function saveEditor() {
       editorState.mtimeMs = fresh.mtimeMs;
       editorState.savedContent = sent;
     }
+    // the copy's own path runs to a couple of hundred characters; where to
+    // find it is what matters, and the full path stays on hover
     el('editor-msg').textContent = res.backupPath
-      ? `Saved. The previous version was kept at ${res.backupPath}`
+      ? 'Saved. The previous version was kept — see "Earlier versions".'
       : 'Saved.';
+    el('editor-msg').title = res.backupPath ? displayPath(res.backupPath) : '';
     await refreshVersions();
-    await loadInventory(currentProjectPath);
+    await refreshInventory();
   } catch (err) {
     el('editor-msg').textContent = err.message;
   } finally {
@@ -933,7 +1098,7 @@ function renderVersions(diffHtml = '') {
         : ''
     }</div>
     ${versions.map((v) => `<div class="version-row">
-      <span class="version-when">${escapeHtml(formatWhen(v))}${v.size === null ? '' : ` · ${v.size} characters`}</span>
+      <span class="version-when">${escapeHtml(formatWhen(v))}${v.size === null || v.size === undefined ? '' : ` · ${num(v.size)} bytes`}</span>
       <span class="version-buttons">
         ${actionButton('See what changed', 'version-diff', { id: v.id })}
         ${versionsRestorable ? actionButton('Put this one back', 'version-restore', { id: v.id }) : ''}
@@ -1023,11 +1188,20 @@ function collapseSame(rows, keep = 2) {
 
 const DIFF_MARK = { del: '−', add: '+', same: ' ', skip: '' };
 
-function renderDiff(rows) {
+// which side is which: the comparison runs from the earlier version to the
+// text in the editor now, not the other way round
+function diffLegend(when) {
+  return `<div class="diff-legend">
+    <span class="diff-del">${DIFF_MARK.del} only in ${when ? `the version from ${escapeHtml(when)}` : 'the earlier version'}</span>
+    <span class="diff-add">${DIFF_MARK.add} only in the editor now</span>
+  </div>`;
+}
+
+function renderDiff(rows, when = null) {
   if (!rows.some((r) => r.type === 'del' || r.type === 'add')) {
     return '<div class="diff"><div class="diff-line diff-same">This version is the same as what is in the editor right now.</div></div>';
   }
-  return `<div class="diff">${rows.map((r) => (r.type === 'skip'
+  return `${diffLegend(when)}<div class="diff">${rows.map((r) => (r.type === 'skip'
     ? `<div class="diff-skip">${escapeHtml(r.text)}</div>`
     : `<div class="diff-line diff-${r.type}">${escapeHtml(`${DIFF_MARK[r.type]} ${r.text}`)}</div>`)).join('')}</div>`;
 }
@@ -1036,7 +1210,8 @@ async function showVersionDiff(id) {
   const old = await fetchJson(
     `/api/file/backups?path=${encodeURIComponent(editorState.filePath)}&project=${encodeURIComponent(editorState.projectPath)}&id=${encodeURIComponent(id)}`
   );
-  renderVersions(renderDiff(diffRows(old.content, el('editor-text').value)));
+  const v = versions.find((x) => x.id === id);
+  renderVersions(renderDiff(diffRows(old.content, el('editor-text').value), v ? formatWhen(v) : null));
 }
 
 async function restoreVersion(id) {
@@ -1055,7 +1230,7 @@ async function restoreVersion(id) {
     el('editor-msg').textContent = 'Put back. The version it replaced was kept too.';
     await refreshVersions();
     renderVersions();
-    await loadInventory(currentProjectPath);
+    await refreshInventory();
   } catch (err) {
     el('editor-msg').textContent = err.message;
   }
@@ -1072,9 +1247,46 @@ function postJson(url, body) {
 }
 
 // Anything that changes more than the open project asks first — those switches
-// sit next to per-project ones that look exactly the same.
+// sit next to per-project ones that look exactly the same. The question names
+// the thing, since the dialog hides the row it came from.
 function confirmGlobal(what, turningOn, reach = 'every project') {
   return confirm(`${what} applies to ${reach}, not just this one. Turn it ${turningOn ? 'on' : 'off'} anyway?`);
+}
+
+// --- keeping focus where it was across a redraw ---------------------------
+
+// Every change redraws the whole page, which would drop keyboard focus back
+// at the top. A button is remembered by what it acts on, so the one drawn in
+// its place can be found again. Data that changes with the click itself (a
+// hook's position, the value the next click sends) is left out of the second try.
+const STABLE_KEYS = ['key', 'name', 'scope', 'settings', 'event', 'signature', 'file', 'group', 'label', 'to', 'keep'];
+
+function buttonIdentity(btn) {
+  if (!btn || !btn.dataset) return null;
+  const all = [...document.getElementById('content').querySelectorAll('button[data-action]')];
+  const same = all.filter((b) => b.dataset.action === btn.dataset.action);
+  return { dataset: { ...btn.dataset }, index: same.indexOf(btn) };
+}
+
+function focusEquivalent(identity) {
+  if (!identity) return;
+  try {
+    const want = identity.dataset;
+    const candidates = [...document.getElementById('content').querySelectorAll('button[data-action]')]
+      .filter((b) => b.dataset.action === want.action);
+    const matches = (b, keys) => keys.every((k) => (b.dataset[k] ?? '') === (want[k] ?? ''));
+    const stable = STABLE_KEYS.filter((k) => want[k]);
+    const target = candidates.find((b) => matches(b, Object.keys(want).filter((k) => k !== 'next')))
+      || (stable.length ? candidates.find((b) => matches(b, stable)) : null)
+      || (identity.index >= 0 ? candidates[identity.index] : null);
+    if (target) target.focus({ preventScroll: true });
+  } catch {
+    /* losing focus is a nuisance, not a reason for the change to look failed */
+  }
+}
+
+function nameOf(filePath) {
+  return String(filePath || '').split(/[\\/]/).filter(Boolean).pop() || filePath;
 }
 
 // One change at a time: a second click before the page has been redrawn would
@@ -1087,7 +1299,7 @@ document.getElementById('content').addEventListener('click', async (ev) => {
   const { action } = btn.dataset;
 
   if (action === 'edit') {
-    openEditor(btn.dataset.path);
+    openEditor(btn.dataset.path, buttonIdentity(btn));
     return;
   }
 
@@ -1095,6 +1307,8 @@ document.getElementById('content').addEventListener('click', async (ev) => {
     await restartDashboard(btn);
     return;
   }
+
+  const identity = buttonIdentity(btn);
 
   if (action === 'permission-add' || action === 'permission-remove') {
     const file = btn.dataset.file;
@@ -1109,15 +1323,24 @@ document.getElementById('content').addEventListener('click', async (ev) => {
         input.focus();
         return;
       }
+      if (!ruleLooksValid(rule) && !confirm(`"${rule}" does not look like a rule Claude Code reads — those look like Bash, Bash(git push:*) or mcp__server__tool. Add it anyway?`)) {
+        input.focus();
+        return;
+      }
     }
+    if (btn.dataset.global && !confirm(action === 'permission-add'
+      ? `${displayPath(file)} is your global settings file, so the rule "${rule}" would apply in every project. Add it?`
+      : `${displayPath(file)} is your global settings file, so removing the rule "${rule}" changes every project. Remove it?`)) return;
     try {
-      await postJson('/api/file/permission', {
+      const res = await postJson('/api/file/permission', {
         filePath: file, projectPath: currentProjectPath, group, rule,
         action: action === 'permission-add' ? 'add' : 'remove',
       });
-      await loadInventory(currentProjectPath);
+      showStatus(describeWrite(res));
+      await refreshInventory();
+      focusEquivalent(identity);
     } catch (err) {
-      alert(err.message);
+      showStatus(err.message, true);
     }
     return;
   }
@@ -1126,57 +1349,60 @@ document.getElementById('content').addEventListener('click', async (ev) => {
   busy = true;
   document.getElementById('content').classList.add('working');
 
-  const nextEnabled = !btn.classList.contains('on'); // clicking an off/unset switch turns it on
+  // what a click sends was decided when the switch was drawn (see switchRow);
+  // a button without it is an action, not a switch
+  const nextEnabled = btn.dataset.next ? btn.dataset.next === 'true' : !btn.classList.contains('on');
 
   try {
+    let res = null;
     if (action === 'toggle-plugin') {
       const scope = btn.dataset.scope || 'project';
-      if (scope === 'global' && !confirmGlobal('This plugin setting', nextEnabled)) return;
-      await postJson('/api/toggle/plugin', {
+      if (scope === 'global' && !confirmGlobal(`The plugin "${btn.dataset.key}"`, nextEnabled)) return;
+      res = await postJson('/api/toggle/plugin', {
         projectPath: btn.dataset.project, key: btn.dataset.key, enabled: nextEnabled, scope,
       });
     } else if (action === 'clear-plugin-override') {
       const scope = btn.dataset.scope || 'project';
-      if (btn.dataset.global && !confirm('This entry is in your global settings, so removing it changes every project. Remove it?')) return;
-      await postJson('/api/toggle/plugin', {
+      if (btn.dataset.global && !confirm(`The entry for "${btn.dataset.key}" is in your global settings, so removing it changes every project. Remove it?`)) return;
+      res = await postJson('/api/toggle/plugin', {
         projectPath: btn.dataset.project, key: btn.dataset.key, clear: true, scope,
       });
     } else if (action === 'toggle-mcp-shared') {
-      const res = await postJson('/api/toggle/mcp-shared', {
+      // the write can land in one file while another one still decides; the
+      // answer says so, and describeWrite puts that in the status line
+      res = await postJson('/api/toggle/mcp-shared', {
         projectPath: btn.dataset.project, name: btn.dataset.name, enabled: nextEnabled,
       });
-      // the write can land in one file while another one still decides
-      if (res && res.note) alert(res.note);
     } else if (action === 'resolve-mcp-duplicate') {
-      if (btn.dataset.global && !confirm('This connection is used in every project, so this decides which definition every project gets. Go ahead?')) return;
-      await postJson('/api/mcp/resolve-duplicate', {
+      if (btn.dataset.global && !confirm(`The connection "${btn.dataset.name}" is used in every project, so this decides which definition every project gets. Go ahead?`)) return;
+      res = await postJson('/api/mcp/resolve-duplicate', {
         scope: btn.dataset.scope, name: btn.dataset.name, keep: btn.dataset.keep, projectPath: btn.dataset.project,
       });
     } else if (action === 'toggle-mcp-local') {
-      await postJson('/api/toggle/mcp-local', {
+      res = await postJson('/api/toggle/mcp-local', {
         projectPath: btn.dataset.project, name: btn.dataset.name, enabled: nextEnabled,
       });
     } else if (action === 'move-mcp') {
-      if (btn.dataset.global && !confirm('This would load the connection into every conversation you start, in every project. Do that?')) return;
-      await postJson('/api/mcp/move', {
+      if (btn.dataset.global && !confirm(`This would load the connection "${btn.dataset.name}" into every conversation you start, in every project. Do that?`)) return;
+      res = await postJson('/api/mcp/move', {
         name: btn.dataset.name, to: btn.dataset.to, projectPath: btn.dataset.project,
       });
     } else if (action === 'toggle-mcp-user') {
-      if (!confirmGlobal('This tool connection', nextEnabled)) return;
-      await postJson('/api/toggle/mcp-user', { name: btn.dataset.name, enabled: nextEnabled });
+      if (!confirmGlobal(`The tool connection "${btn.dataset.name}"`, nextEnabled)) return;
+      res = await postJson('/api/toggle/mcp-user', { name: btn.dataset.name, enabled: nextEnabled });
     } else if (action === 'toggle-file') {
-      if (btn.dataset.scope === 'global' && !confirmGlobal('This one', nextEnabled)) return;
-      await postJson('/api/toggle/file', {
+      if (btn.dataset.scope === 'global' && !confirmGlobal(`"${btn.dataset.label || nameOf(btn.dataset.path)}"`, nextEnabled)) return;
+      res = await postJson('/api/toggle/file', {
         filePath: btn.dataset.path, enabled: nextEnabled, projectPath: currentProjectPath,
       });
     } else if (action === 'toggle-markdown') {
-      if (btn.dataset.global && !confirmGlobal('This instructions file', nextEnabled, btn.dataset.global)) return;
-      await postJson('/api/toggle/markdown', {
+      if (btn.dataset.global && !confirmGlobal(`The instructions file ${displayPath(btn.dataset.path)}`, nextEnabled, btn.dataset.global)) return;
+      res = await postJson('/api/toggle/markdown', {
         filePath: btn.dataset.path, enabled: nextEnabled, projectPath: currentProjectPath,
       });
     } else if (action === 'toggle-hook') {
-      if (btn.dataset.global && !confirmGlobal('This hook', nextEnabled)) return;
-      await postJson('/api/toggle/hook', {
+      if (btn.dataset.global && !confirmGlobal(`The hook "${btn.dataset.label || btn.dataset.event}"`, nextEnabled)) return;
+      res = await postJson('/api/toggle/hook', {
         projectPath: currentProjectPath,
         settingsPath: btn.dataset.settings,
         event: btn.dataset.event,
@@ -1185,9 +1411,11 @@ document.getElementById('content').addEventListener('click', async (ev) => {
         enabled: nextEnabled,
       });
     }
-    await loadInventory(currentProjectPath);
+    showStatus(describeWrite(res));
+    await refreshInventory();
+    focusEquivalent(identity);
   } catch (err) {
-    alert(err.message);
+    showStatus(err.message, true);
   } finally {
     busy = false;
     document.getElementById('content').classList.remove('working');
@@ -1219,6 +1447,7 @@ window.addEventListener('beforeunload', (ev) => {
   if (editorDirty()) ev.preventDefault();
 });
 document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Tab' && !el('editor').hidden) trapEditorFocus(ev);
   if (ev.key === 'Escape' && !el('editor').hidden) closeEditor();
   if ((ev.metaKey || ev.ctrlKey) && ev.key === 's' && !el('editor').hidden) {
     ev.preventDefault();

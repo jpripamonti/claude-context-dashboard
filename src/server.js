@@ -63,7 +63,12 @@ function readJsonBody(req) {
       reject(Object.assign(new Error('expected application/json'), { statusCode: 400 }));
       return;
     }
-    let data = '';
+    // Kept as bytes and decoded once at the end. Decoding each piece as it
+    // arrived split any character that straddled two pieces — a long file full
+    // of "—" came back with a few of them turned into U+FFFD — and counted
+    // characters against a limit stated in bytes.
+    const chunks = [];
+    let received = 0;
     let tooBig = false;
     req.on('data', (chunk) => {
       // A settings file or an instructions file is kilobytes; anything past
@@ -72,16 +77,18 @@ function readJsonBody(req) {
       // rather than cutting the connection, so the sender gets the refusal
       // instead of a broken pipe.
       if (tooBig) return;
-      data += chunk;
-      if (data.length > MAX_BODY_BYTES) {
+      received += chunk.length;
+      chunks.push(chunk);
+      if (received > MAX_BODY_BYTES) {
         tooBig = true;
-        data = '';
+        chunks.length = 0;
         reject(Object.assign(new Error(`request body is too large (over ${MAX_BODY_BYTES} bytes)`), { statusCode: 413 }));
       }
     });
     req.on('end', () => {
       if (tooBig) return;
       try {
+        const data = Buffer.concat(chunks).toString('utf8');
         resolve(data ? JSON.parse(data) : {});
       } catch (err) {
         reject(Object.assign(err, { statusCode: 400 }));

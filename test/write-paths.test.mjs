@@ -972,8 +972,15 @@ w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
   // what is left is the newest copy of every file, which is never given up
   process.env.CLAUDE_DASHBOARD_BACKUP_BUDGET = '1';
   const before = fs.readdirSync(backupsDir).length;
+  const fileOf = (n) => n.replace(/\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.bak$/, '');
+  const filesBefore = new Set(fs.readdirSync(backupsDir).map(fileOf));
   await saveTo(projectMd, '# after the budget\n');
   const after = fs.readdirSync(backupsDir);
+  // counting copies per file cannot see a file that has none left at all
+  const filesAfter = new Set(after.map(fileOf));
+  check('every file that had a copy before the budget bit still has one',
+    filesBefore.size > 1 && [...filesBefore].every((f) => filesAfter.has(f)),
+    `${[...filesBefore].filter((f) => !filesAfter.has(f)).length} of ${filesBefore.size} files left with none`);
   check('a budget that bites clears the oldest copies', after.length < before, `${before} → ${after.length}`);
   check('and it comes down to the newest of each file, nothing more',
     after.length === new Set(after.map((n) => n.replace(/\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.bak$/, ''))).size,
@@ -1279,6 +1286,17 @@ w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
   check('a post that is not JSON does not restart anything',
     notJson.status === 400 && restartsAsked === before + 1, `${notJson.status} restarts=${restartsAsked - before}`);
 
+  // the body above is not JSON either, so it would be refused by the parser
+  // alone; a valid one under the wrong type is what tests the type check
+  const validButPlain = await fetch(BASE + '/api/restart', {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain', Origin: BASE },
+    body: '{}',
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  check('valid JSON sent as plain text does not restart anything either',
+    validButPlain.status === 400 && restartsAsked === before + 1, `${validButPlain.status} restarts=${restartsAsked - before}`);
+
   const fromElsewhere = await fetch(BASE + '/api/restart', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example' },
@@ -1349,6 +1367,347 @@ check('a subagent file that is a symlink is listed', !!linkedAgent, JSON.stringi
 check('and its description is read through the link, so it counts towards the weight',
   linkedAgent?.description === 'lives in another repo' && linkedAgent?.startupBytes > 0, JSON.stringify(linkedAgent));
 check('and the row says where the link really points', linkedAgent?.symlink === realAgent, linkedAgent?.symlink);
+
+// --- review fixes: write paths ------------------------------------------
+// Each of these was proven wrong by review, with a script that showed it.
+{
+  const backupsDir = path.join(HOME, '.claude-context-dashboard', 'backups');
+  const readFile = async (p2, project = PROJECT) =>
+    (await get(`/api/file?path=${encodeURIComponent(p2)}&project=${encodeURIComponent(project)}`)).body;
+  const versionsOf = async (p2, project = PROJECT) =>
+    (await get(`/api/file/backups?path=${encodeURIComponent(p2)}&project=${encodeURIComponent(project)}`)).body;
+  const saveTo = async (p2, content, project = PROJECT) => {
+    const now = await readFile(p2, project);
+    return post('/api/file/save', { filePath: p2, projectPath: project, content, expectedMtimeMs: now.mtimeMs });
+  };
+  const STAMP = /\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.bak$/;
+
+  // A request body arrives in pieces, and a character can straddle two of them:
+  // decoding each piece on its own turned a few of a long file's "—" into U+FFFD.
+  {
+    const long = Array.from({ length: 20000 }, (_, i) => `line ${i} — some prose here, é ok`).join('\n') + '\n';
+    res = await saveTo(projectMd, long);
+    const back = fs.readFileSync(projectMd, 'utf8');
+    check('a long save full of characters wider than a byte comes back exactly as sent',
+      res.status === 200 && back === long, `${res.status} replacement chars: ${(back.match(/�/g) || []).length}`);
+    w(projectMd, '# project rules\n');
+  }
+
+  // Two files whose paths differ only in "/" against "__" were given the same
+  // name for their copies, so one file's versions were offered, and put back,
+  // as the other's.
+  const C = path.join(SANDBOX, 'collide');
+  const A = path.join(C, 'a', 'b', 'CLAUDE.md');
+  const B = path.join(C, 'a__b', 'CLAUDE.md');
+  w(A, 'SECRET A original\n');
+  w(B, 'B original\n');
+  {
+    res = await saveTo(A, 'A v2\n', path.join(C, 'a'));
+    check('(the first of two look-alike paths is saved)', res.status === 200, JSON.stringify(res.body));
+    const forB = await versionsOf(B, C);
+    check('a file is not offered the versions of a different file whose path looks the same once flattened',
+      Array.isArray(forB.versions) && forB.versions.length === 0, JSON.stringify(forB.versions));
+    const forA = await versionsOf(A, path.join(C, 'a'));
+    check('and the file that was saved still has its own',
+      forA.versions?.length === 1, JSON.stringify(forA.versions));
+  }
+
+  // A path holding a line break: the old shape of a copy's name could not be
+  // matched across it, so its copies were made and then never seen again.
+  {
+    const NL = path.join(C, 'line\nbreak', 'CLAUDE.md');
+    w(NL, '# odd folder\n');
+    const nlInv = await inventory(C);
+    if (nlInv.claudeMd.nested.some((f) => f.path === NL)) {
+      res = await saveTo(NL, '# changed\n', C);
+      const list = await versionsOf(NL, C);
+      check('a file whose path holds a line break lists the version its save kept',
+        res.status === 200 && list.versions?.length === 1, `${res.status} ${JSON.stringify(list.versions)}`);
+    } else {
+      check('(a folder with a line break in its name is listed, so its versions can be checked)', false,
+        JSON.stringify(nlInv.claudeMd.nested.map((f) => f.path)));
+    }
+    fs.rmSync(path.dirname(NL), { recursive: true, force: true });
+  }
+
+  // Copies made under the old names are still on disk. They are taken over by
+  // a file only when it is the one file the old name can mean.
+  {
+    const legacy = (p2, stamp) => path.join(backupsDir, `${p2.replace(/[\\/]/g, '__')}.${stamp}.bak`);
+    const SOLO = path.join(C, 'solo', 'CLAUDE.md');
+    w(SOLO, '# solo now\n');
+    w(legacy(SOLO, '2020-01-01T00-00-00-000Z'), '# solo, as it was in 2020\n');
+    const shared = legacy(A, '2020-01-02T00-00-00-000Z'); // A and B both flatten to this
+    w(shared, 'whose is this?\n');
+
+    const solo = await versionsOf(SOLO, C);
+    const id = solo.versions?.[0]?.id;
+    const kept = id ? (await get(`/api/file/backups?path=${encodeURIComponent(SOLO)}&project=${encodeURIComponent(C)}&id=${encodeURIComponent(id)}`)).body : {};
+    check('a copy kept under the old kind of name is still listed when only one file can own it',
+      solo.versions?.length === 1 && kept.content === '# solo, as it was in 2020\n', JSON.stringify(solo.versions));
+    check('and it now carries the new kind of name, so it reads back to that one file',
+      !!id && !id.startsWith('__') && !fs.existsSync(legacy(SOLO, '2020-01-01T00-00-00-000Z')), id);
+    const forA = await versionsOf(A, path.join(C, 'a'));
+    const forB = await versionsOf(B, C);
+    check('an old name two files could own is offered to neither',
+      !forA.versions.some((v) => v.id === path.basename(shared)) && forB.versions.length === 0 &&
+      forA.versions.every((v) => !v.id.startsWith('__')),
+      JSON.stringify([forA.versions.map((v) => v.id), forB.versions.map((v) => v.id)]));
+    check('and it is left in the folder rather than thrown away', fs.existsSync(shared));
+    res = await post('/api/file/restore', {
+      filePath: B, projectPath: C, id: path.basename(shared), expectedMtimeMs: fs.statSync(B).mtimeMs,
+    });
+    check('nor can it be put back into either of them by naming it',
+      res.status === 400 && fs.readFileSync(B, 'utf8') === 'B original\n', `${res.status} ${JSON.stringify(res.body)}`);
+  }
+
+  // A version goes back byte for byte: reading it as text first turned a file
+  // that is not UTF-8 into replacement characters.
+  {
+    const original = Buffer.from('caf\xe9 r\xe9sum\xe9\r\n', 'latin1');
+    fs.writeFileSync(projectMd, original);
+    res = await post('/api/file/save', {
+      filePath: projectMd, projectPath: PROJECT, content: '# new\n', expectedMtimeMs: fs.statSync(projectMd).mtimeMs,
+    });
+    const id = (await versionsOf(projectMd)).versions[0].id;
+    res = await post('/api/file/restore', { filePath: projectMd, projectPath: PROJECT, id, expectedMtimeMs: fs.statSync(projectMd).mtimeMs });
+    check('putting back a version of a file that is not UTF-8 restores the same bytes',
+      res.status === 200 && fs.readFileSync(projectMd).equals(original), fs.readFileSync(projectMd).toString('hex'));
+    w(projectMd, '# project rules\n');
+  }
+
+  // Something else writing the file while its copy is being taken: the rename
+  // used to go ahead and throw that write away.
+  {
+    const realCopy = fs.copyFileSync;
+    const theirs = '# written by a Claude Code session in the meantime\n';
+    fs.copyFileSync = (from, to, ...rest) => {
+      const r = realCopy(from, to, ...rest);
+      if (String(from) === projectMd) realWrite(projectMd, theirs);
+      return r;
+    };
+    res = await saveTo(projectMd, '# mine\n');
+    fs.copyFileSync = realCopy;
+    check('a write that lands while the copy is being taken is not thrown away',
+      res.status === 409 && fs.readFileSync(projectMd, 'utf8') === theirs, `${res.status} ${JSON.stringify(res.body)}`);
+    check('and the temporary file is cleared up',
+      !fs.readdirSync(PROJECT).some((n) => n.includes('.tmp-')), JSON.stringify(fs.readdirSync(PROJECT)));
+    w(projectMd, '# project rules\n');
+  }
+
+  // Over the total, space comes back from the file using the most of it: going
+  // oldest-first across every file let one big file wipe out the others' history.
+  {
+    fs.rmSync(backupsDir, { recursive: true, force: true });
+    for (let i = 0; i < 4; i++) await saveTo(projectMd, `# small ${i}\n`);
+    const big = (i) => JSON.stringify({ pad: 'x'.repeat(40000), i }) + '\n';
+    for (let i = 0; i < 6; i++) await saveTo(PROJECT_SETTINGS, big(i));
+    process.env.CLAUDE_DASHBOARD_BACKUP_BUDGET = String(3 * 41000);
+    await saveTo(PROJECT_SETTINGS, big(6));
+    delete process.env.CLAUDE_DASHBOARD_BACKUP_BUDGET;
+    const small = (await versionsOf(projectMd)).versions;
+    const bigOnes = (await versionsOf(PROJECT_SETTINGS)).versions;
+    check('a budget that bites takes from the file using the most space, not every file\'s oldest',
+      small.length === 4 && bigOnes.length >= 1 && bigOnes.length < 7, `small ${small.length}, big ${bigOnes.length}`);
+    w(projectMd, '# project rules\n');
+    w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
+  }
+
+  // A key holding the wrong kind of value was replaced, so what it held was lost.
+  {
+    w(PROJECT_SETTINGS, JSON.stringify({ permissions: { allow: 'Bash(ls:*)' } }, null, 2));
+    const was = fs.readFileSync(PROJECT_SETTINGS, 'utf8');
+    res = await post('/api/file/permission', {
+      filePath: PROJECT_SETTINGS, projectPath: PROJECT, group: 'allow', rule: 'Bash(cat:*)', action: 'add',
+    });
+    check('adding a rule to a group that is not a list is refused, and the file is left alone',
+      res.status === 400 && /permissions\.allow/.test(res.body.error || '') && fs.readFileSync(PROJECT_SETTINGS, 'utf8') === was,
+      `${res.status} ${JSON.stringify(res.body)}`);
+    w(PROJECT_SETTINGS, JSON.stringify({ permissions: [] }, null, 2));
+    res = await post('/api/file/permission', {
+      filePath: PROJECT_SETTINGS, projectPath: PROJECT, group: 'deny', rule: 'Bash(rm:*)', action: 'add',
+    });
+    check('and so is adding one where "permissions" itself is not a set of groups',
+      res.status === 400 && Array.isArray(readJson(PROJECT_SETTINGS).permissions), `${res.status} ${JSON.stringify(res.body)}`);
+    w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
+
+    const claudeJson = path.join(HOME, '.claude.json');
+    const keptJson = fs.readFileSync(claudeJson, 'utf8');
+    const proj = fs.realpathSync(PROJECT);
+    const d = JSON.parse(keptJson);
+    d.mcpServers = { roamer: { command: 'roam' } };
+    d.projects = { ...(d.projects || {}), [proj]: { ...(d.projects?.[proj] || {}), mcpServers: 'oops' } };
+    w(claudeJson, JSON.stringify(d, null, 2));
+    const before = fs.readFileSync(claudeJson, 'utf8');
+    res = await post('/api/mcp/move', { name: 'roamer', to: 'project', projectPath: PROJECT });
+    check('moving a connection into a list that is not a set of entries is refused, and it is not lost',
+      res.status === 400 && fs.readFileSync(claudeJson, 'utf8') === before, `${res.status} ${JSON.stringify(res.body)}`);
+    w(claudeJson, JSON.stringify({ ...JSON.parse(keptJson), mcpServers: [{ name: 'listed' }] }, null, 2));
+    const asList = fs.readFileSync(claudeJson, 'utf8');
+    res = await post('/api/toggle/mcp-user', { name: 'listed', enabled: false });
+    check('switching off a connection where "mcpServers" is a list is refused, not reported as done',
+      res.status === 400 && /mcpServers/.test(res.body.error || '') && fs.readFileSync(claudeJson, 'utf8') === asList,
+      `${res.status} ${JSON.stringify(res.body)}`);
+    w(claudeJson, keptJson);
+    fs.chmodSync(claudeJson, 0o600);
+  }
+
+  // A project whose .claude folder is a link to the global one: a switch that
+  // says "this project" wrote the settings every project reads.
+  {
+    const REPO = path.join(SANDBOX, 'repo-linked-claude');
+    w(path.join(REPO, 'CLAUDE.md'), '# cloned\n');
+    fs.symlinkSync(path.join(HOME, '.claude'), path.join(REPO, '.claude'));
+    const globalWas = fs.readFileSync(GLOBAL_SETTINGS, 'utf8');
+    res = await post('/api/toggle/plugin', { projectPath: REPO, key: 'demo@market', enabled: false, scope: 'project' });
+    check('a "this project" switch through a linked .claude folder is refused, and the global file untouched',
+      res.status === 400 && /every project reads/.test(res.body.error || '') && fs.readFileSync(GLOBAL_SETTINGS, 'utf8') === globalWas,
+      `${res.status} ${JSON.stringify(res.body)}`);
+    res = await post('/api/toggle/plugin', { projectPath: REPO, key: 'demo@market', clear: true, scope: 'project' });
+    check('and so is clearing a project override through it',
+      res.status === 400 && fs.readFileSync(GLOBAL_SETTINGS, 'utf8') === globalWas, `${res.status} ${JSON.stringify(res.body)}`);
+    const globalSkill = path.join(HOME, '.claude', 'skills', 'tidy', 'SKILL.md');
+    refused = null;
+    try {
+      toggle.toggleFile({ filePath: path.join(REPO, '.claude', 'skills', 'tidy', 'SKILL.md'), enabled: false, projectPath: REPO });
+    } catch (err) { refused = err; }
+    check('and a "project" skill that is really a global one is not switched off',
+      refused?.statusCode === 400 && fs.existsSync(globalSkill), refused?.message);
+    fs.rmSync(REPO, { recursive: true, force: true });
+
+    // the file itself being a link: still fine into a dotfiles repo, refused into ~/.claude
+    const P3 = path.join(SANDBOX, 'linked-file-proj');
+    w(path.join(P3, 'CLAUDE.md'), '# p3\n');
+    fs.mkdirSync(path.join(P3, '.claude'), { recursive: true });
+    const P3S = path.join(P3, '.claude', 'settings.json');
+    fs.symlinkSync(GLOBAL_SETTINGS, P3S);
+    res = await post('/api/toggle/plugin', { projectPath: P3, key: 'demo@market', enabled: false, scope: 'project' });
+    check('a project settings file that is a link to the global one is refused too',
+      res.status === 400 && fs.readFileSync(GLOBAL_SETTINGS, 'utf8') === globalWas, `${res.status} ${JSON.stringify(res.body)}`);
+    fs.unlinkSync(P3S);
+    const p3Dotfile = path.join(HOME, 'dotfiles', 'p3-settings.json');
+    w(p3Dotfile, JSON.stringify({}, null, 2));
+    fs.symlinkSync(p3Dotfile, P3S);
+    res = await post('/api/toggle/plugin', { projectPath: P3, key: 'demo@market', enabled: false, scope: 'project' });
+    check('but one linked into a dotfiles repo is still written through, and stays a link',
+      res.status === 200 && readJson(p3Dotfile).enabledPlugins?.['demo@market'] === false && fs.lstatSync(P3S).isSymbolicLink(),
+      `${res.status} ${JSON.stringify(res.body)}`);
+    fs.rmSync(P3, { recursive: true, force: true });
+
+    // the editor: a subfolder that is a link out of the project
+    const OUT = path.join(SANDBOX, 'outside-target');
+    w(path.join(OUT, 'CLAUDE.md'), '# lives outside\n');
+    const P4 = path.join(SANDBOX, 'linked-sub-proj');
+    w(path.join(P4, 'CLAUDE.md'), '# p4\n');
+    fs.symlinkSync(OUT, path.join(P4, 'pkg'));
+    const linkedMd = path.join(P4, 'pkg', 'CLAUDE.md');
+    const opened = await readFile(linkedMd, P4);
+    check('a file in a folder that links out of the project opens read-only, saying why',
+      opened.writable === false && /outside this project/.test(opened.readOnlyReason || ''), JSON.stringify(opened).slice(0, 240));
+    res = await post('/api/file/save', { filePath: linkedMd, projectPath: P4, content: 'PWNED\n', expectedMtimeMs: opened.mtimeMs });
+    check('and saving it is refused, leaving the file it really is alone',
+      res.status === 400 && fs.readFileSync(path.join(OUT, 'CLAUDE.md'), 'utf8') === '# lives outside\n',
+      `${res.status} ${JSON.stringify(res.body)}`);
+    fs.rmSync(P4, { recursive: true, force: true });
+  }
+
+  // Answers say what kind of "no" they are.
+  {
+    const now = await readFile(projectMd);
+    await post('/api/file/save', { filePath: projectMd, projectPath: PROJECT, content: '# one\n', expectedMtimeMs: now.mtimeMs });
+    res = await post('/api/file/save', { filePath: projectMd, projectPath: PROJECT, content: '# two\n', expectedMtimeMs: now.mtimeMs });
+    check('a save against a file that changed meanwhile is a conflict (409)', res.status === 409, `${res.status} ${JSON.stringify(res.body)}`);
+    res = await post('/api/file/permission', { filePath: PROJECT_SETTINGS, projectPath: PROJECT, group: 'nonsense', rule: 'x', action: 'add' });
+    check('a request that makes no sense is a bad request (400), not a server failure', res.status === 400, `${res.status}`);
+    res = await post('/api/file/save', { filePath: path.join(HOME, 'nothing-to-see'), projectPath: PROJECT, content: 'x', expectedMtimeMs: null });
+    check('and so is asking for a file the dashboard is not showing', res.status === 400, `${res.status}`);
+    w(projectMd, '# project rules\n');
+  }
+
+  // The checks below are each the only thing that notices if one line goes.
+  {
+    // the content-type rule on its own, with a body that is valid JSON
+    const settingsWas = fs.readFileSync(PROJECT_SETTINGS, 'utf8');
+    const plain = await fetch(BASE + '/api/toggle/plugin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain', Origin: BASE },
+      body: JSON.stringify({ projectPath: PROJECT, key: 'demo@market', enabled: false, scope: 'project' }),
+    });
+    check('a switch sent as plain text is refused even when the body is valid JSON',
+      plain.status === 400 && fs.readFileSync(PROJECT_SETTINGS, 'utf8') === settingsWas, `${plain.status}`);
+
+    // permissions carried over, past the umask
+    const oldMask = process.umask(0o022);
+    fs.chmodSync(PROJECT_SETTINGS, 0o664);
+    res = await post('/api/toggle/plugin', { projectPath: PROJECT, key: 'demo@market', enabled: false, scope: 'project' });
+    check('a written file keeps permissions the umask would otherwise strip',
+      res.status === 200 && (fs.statSync(PROJECT_SETTINGS).mode & 0o777) === 0o664, (fs.statSync(PROJECT_SETTINGS).mode & 0o777).toString(8));
+    w(PROJECT_SETTINGS, JSON.stringify({}, null, 2));
+
+    const fresh = path.join(PROJECT, '.claude', 'settings.local.json');
+    fs.rmSync(fresh, { force: true });
+    res = await post('/api/file/save', { filePath: fresh, projectPath: PROJECT, content: '{}\n', expectedMtimeMs: null });
+    check('a file created here is readable by you alone',
+      res.status === 200 && (fs.statSync(fresh).mode & 0o777) === 0o600, (fs.statSync(fresh).mode & 0o777).toString(8));
+    fs.rmSync(fresh, { force: true });
+
+    // a backup folder left open by an older version is locked down by the next write
+    const dash = path.dirname(backupsDir);
+    fs.rmSync(backupsDir, { recursive: true, force: true });
+    fs.chmodSync(dash, 0o755);
+    fs.mkdirSync(backupsDir, { mode: 0o755 });
+    fs.chmodSync(backupsDir, 0o755);
+    res = await saveTo(projectMd, '# locks the folder\n');
+    check('a backup folder that was left open is made private again',
+      res.status === 200 && (fs.statSync(dash).mode & 0o777) === 0o700 && (fs.statSync(backupsDir).mode & 0o777) === 0o700,
+      `${(fs.statSync(dash).mode & 0o777).toString(8)} / ${(fs.statSync(backupsDir).mode & 0o777).toString(8)}`);
+    // and one made fresh is private from the start, even when it cannot be chmodded
+    fs.rmSync(backupsDir, { recursive: true, force: true });
+    const realChmod2 = fs.chmodSync;
+    fs.chmodSync = (p2, m) => {
+      if (String(p2).includes('.claude-context-dashboard')) throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+      return realChmod2(p2, m);
+    };
+    res = await saveTo(projectMd, '# a fresh folder\n');
+    fs.chmodSync = realChmod2;
+    check('a backup folder is created private, not only made so afterwards',
+      res.status === 200 && (fs.statSync(backupsDir).mode & 0o777) === 0o700, (fs.statSync(backupsDir).mode & 0o777).toString(8));
+    process.umask(oldMask);
+    w(projectMd, '# project rules\n');
+
+    // a plugin's file reached by an "@" line is on the editable list, which is
+    // why the plugin-cache refusal is there at all
+    const P5 = path.join(SANDBOX, 'imports-plugin');
+    const spec = '~/' + path.relative(HOME, pluginSkill).split(path.sep).join('/');
+    w(path.join(P5, 'CLAUDE.md'), `# p5\n@${spec}\n`);
+    const pluginText = fs.readFileSync(pluginSkill, 'utf8');
+    const viaImport = await readFile(pluginSkill, P5);
+    check('a plugin\'s file pulled in by an @ line opens read-only, and says it is the plugin\'s',
+      viaImport.writable === false && /belongs to a plugin/.test(viaImport.readOnlyReason || ''), JSON.stringify(viaImport).slice(0, 240));
+    res = await post('/api/file/save', { filePath: pluginSkill, projectPath: P5, content: 'changed\n', expectedMtimeMs: viaImport.mtimeMs });
+    check('and saving it is refused',
+      res.status === 400 && /belongs to a plugin/.test(res.body.error || '') && fs.readFileSync(pluginSkill, 'utf8') === pluginText,
+      `${res.status} ${JSON.stringify(res.body)}`);
+    fs.rmSync(P5, { recursive: true, force: true });
+
+    // an "@" line reaching out of the project and the global .claude folder
+    const P6 = path.join(SANDBOX, 'imports-outside');
+    const elsewhereDoc = path.join(SANDBOX, 'not-a-project', 'shared-notes.md');
+    w(elsewhereDoc, '# someone else\'s notes\n');
+    w(path.join(P6, 'CLAUDE.md'), `# p6\n@${elsewhereDoc}\n`);
+    const outsideRead = await readFile(elsewhereDoc, P6);
+    check('a file an @ line pulls in from outside the project opens read-only, and says that is why',
+      outsideRead.writable === false && /outside this project/.test(outsideRead.readOnlyReason || '') &&
+      !/not showing/.test(outsideRead.readOnlyReason || ''), JSON.stringify(outsideRead).slice(0, 240));
+    res = await post('/api/file/save', { filePath: elsewhereDoc, projectPath: P6, content: 'x\n', expectedMtimeMs: outsideRead.mtimeMs });
+    check('and its save is refused for that same reason',
+      res.status === 400 && /outside this project/.test(res.body.error || '') &&
+      fs.readFileSync(elsewhereDoc, 'utf8') === '# someone else\'s notes\n', `${res.status} ${JSON.stringify(res.body)}`);
+    fs.rmSync(P6, { recursive: true, force: true });
+    fs.rmSync(path.dirname(elsewhereDoc), { recursive: true, force: true });
+  }
+  fs.rmSync(C, { recursive: true, force: true });
+}
 
 server.close();
 if (failures) {
