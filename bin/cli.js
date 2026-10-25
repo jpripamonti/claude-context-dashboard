@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { startServer, takeTokenFromEnv } from '../src/server.js';
+import { startServer, takeTokenFromEnv, writeTokenFile, removeTokenFile } from '../src/server.js';
 
 const USAGE = `claude-context — dashboard for what Claude Code loads in a project
 
@@ -51,7 +51,22 @@ const projectPath = path.resolve(args.path);
 // process's environment, so nothing started from here inherits it.
 const handedOver = takeTokenFromEnv();
 
-startServer({ projectPath, port: args.port, ...(handedOver ? { token: handedOver } : {}) }).then(({ url }) => {
+startServer({ projectPath, port: args.port, ...(handedOver ? { token: handedOver } : {}) }).then(({ url, port, token }) => {
+  // The desktop launcher (bin/open-dashboard.sh) has no terminal to read the
+  // address from, so the key is also left in a file only this user can read,
+  // and taken away again when this process ends.
+  try {
+    writeTokenFile(port, token);
+    process.on('exit', () => removeTokenFile(port, token));
+  } catch (err) {
+    console.error(`(could not leave the key for the desktop launcher: ${err.message})`);
+  }
+  // Ctrl+C and kill end a process without 'exit' handlers running, which would
+  // leave the key file (and the browser trampoline below) behind; this exits
+  // instead, with the code a shell gives a process the signal ended. A restart
+  // replaces these with handlers that pass the signal on (src/server.js).
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => process.exit(128 + os.constants.signals[signal]));
+
   console.log(`claude-context-dashboard`);
   console.log(`  project: ${projectPath}`);
   console.log(`  url:     ${url}`);

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { paths, buildInventory, editablePathsFrom, viewablePathsFrom, unpackParkedHook, isPlainObject, describeJson, PARKED_SLOT_KEY, isOutsideImport } from './scan.js';
 
 const BACKUP_DIR = path.join(os.homedir(), '.claude-context-dashboard', 'backups');
@@ -29,80 +30,49 @@ function encodeSource(p) {
   return p.replace(/[%\\/:*?"<>|\x00-\x1f\x7f]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
 }
 
+// A copy's full name — source, moment, ".bak" — is held to this many bytes.
+// Most file systems stop at 255, and the encoded form is longer than the path
+// it spells (every separator is three characters), so a deep path that saved
+// fine under the older names failed every save once it was spelled this way.
+const MAX_BACKUP_NAME_BYTES = 200;
+const STAMP_SUFFIX_BYTES = '.2026-01-01T00-00-00-000Z.bak'.length;
+
+// The part of a copy's name that says which file it is a copy of. A path too
+// long to spell out in full is named by a hash of the whole path instead, with
+// as much of the path's end (its folder and file name) as still fits, so it is
+// still readable and still maps to exactly one file. "%-" cannot occur in a
+// spelled-out name — encodeSource only ever writes "%" before two hex digits —
+// so a hashed name never equals one spelled out in full.
+function backupBase(p) {
+  const full = encodeSource(p);
+  if (Buffer.byteLength(full, 'utf8') + STAMP_SUFFIX_BYTES <= MAX_BACKUP_NAME_BYTES) return full;
+  const head = `%-${crypto.createHash('sha256').update(p, 'utf8').digest('hex').slice(0, 32)}-`;
+  const room = MAX_BACKUP_NAME_BYTES - STAMP_SUFFIX_BYTES - head.length;
+  let tail = '';
+  let used = 0;
+  const chars = [...p]; // whole characters, so a name never ends half way through one
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const piece = encodeSource(chars[i]);
+    const bytes = Buffer.byteLength(piece, 'utf8');
+    if (used + bytes > room) break;
+    tail = piece + tail;
+    used += bytes;
+  }
+  return head + tail;
+}
+
 // The older names turned each separator into "__", which does not read back:
 // /p/a/b/CLAUDE.md and /p/a__b/CLAUDE.md both became "__p__a__b__CLAUDE.md",
 // so one file's versions were offered — and put back — as the other's. Those
-// copies are still on disk; see adoptLegacyCopies for what happens to them.
+// copies are still on disk, and are left under their old names: which file one
+// came from cannot be known, only guessed from what exists now, and a guess
+// made after the other file was deleted hands its history to the survivor for
+// good. So they are shown, for a file whose old-style name is exactly theirs,
+// as something to read and compare — marked as possibly another file's — and
+// never put back (see listBackups). Pruning treats each old name as a file of
+// its own, under the same rules.
 function legacyFlat(p) {
   return p.replace(/[\\/]/g, '__');
-}
-
-// Every file on disk right now whose old-style name is `flat`, found by
-// walking down from the root and trying each way the "__"s could be read. It
-// stops at two: all that matters is whether there is exactly one.
-function legacyOwners(flat) {
-  let root;
-  let rest;
-  if (process.platform === 'win32') {
-    const drive = /^([A-Za-z]:)__/.exec(flat);
-    if (!drive) return []; // a network path, or not a path at all: claimed by nobody
-    root = drive[1] + '\\';
-    rest = flat.slice(drive[0].length);
-  } else {
-    if (!flat.startsWith('__')) return [];
-    root = '/';
-    rest = flat.slice(2);
-  }
-  const found = [];
-  const isDir = (p) => {
-    try {
-      return fs.statSync(p).isDirectory();
-    } catch {
-      return false;
-    }
-  };
-  const walk = (dir, left, depth) => {
-    if (found.length > 1 || depth > 64) return;
-    let names;
-    try {
-      names = fs.readdirSync(dir);
-    } catch {
-      return;
-    }
-    for (const name of names) {
-      const piece = legacyFlat(name); // a name may hold a backslash on its own
-      const here = path.join(dir, name);
-      if (left === piece && !isDir(here)) found.push(here);
-      else if (left.startsWith(piece + '__') && isDir(here)) walk(here, left.slice(piece.length + 2), depth + 1);
-      if (found.length > 1) return;
-    }
-  };
-  walk(root, rest, 0);
-  return found;
-}
-
-// Copies made under the older names are renamed to the new form, but only
-// when the file asking for them is the one and only file on disk that the old
-// name could mean. When two could (both of the paths above exist), neither is
-// shown them: a version offered for the wrong file is the bug this replaces.
-// Those stay in the folder under their old names, kept and pruned like any
-// other, and can still be opened by hand. A file that no longer exists cannot
-// claim anything either, so a switched-off file's copies wait until it is back.
-function adoptLegacyCopies(source) {
-  const flat = legacyFlat(source);
-  const old = backupNames().filter((copy) => copy.of === flat);
-  if (old.length === 0) return;
-  const owners = legacyOwners(flat);
-  if (owners.length !== 1 || owners[0] !== source) return;
-  for (const copy of old) {
-    const renamed = path.join(BACKUP_DIR, `${encodeSource(source)}.${copy.stamp}.bak`);
-    if (fs.existsSync(renamed)) continue; // never over another copy
-    try {
-      fs.renameSync(path.join(BACKUP_DIR, copy.name), renamed);
-    } catch {
-      /* left under its old name: still kept, just not listed */
-    }
-  }
 }
 
 // Nothing used to remove these, and every write copies the whole file: with a
@@ -125,7 +95,15 @@ function backupBeforeWrite(filePath) {
   // Only you: the file names alone spell out every path you have edited, and
   // the copies hold whatever the originals held, keys included. Best effort —
   // a folder we cannot chmod (someone else owns it) must not block every save.
-  fs.mkdirSync(BACKUP_DIR, { recursive: true, mode: 0o700 });
+  const cannotCopy = (err) =>
+    new Error(
+      `Could not keep a copy of ${filePath} before writing it (${err.code || err.message}), so nothing was written. Every write here is copied first; free some space or fix ${BACKUP_DIR}, then try again.`
+    );
+  try {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true, mode: 0o700 });
+  } catch (err) {
+    throw cannotCopy(err);
+  }
   for (const dir of [path.dirname(BACKUP_DIR), BACKUP_DIR]) {
     try {
       fs.chmodSync(dir, 0o700);
@@ -133,10 +111,20 @@ function backupBeforeWrite(filePath) {
       /* keep going: the backup itself still keeps the source file's own mode */
     }
   }
-  // first, so the moment given to this copy is clamped above those too
-  adoptLegacyCopies(filePath);
-  const backupPath = nextBackupPath(encodeSource(filePath));
-  fs.copyFileSync(filePath, backupPath);
+  const backupPath = nextBackupPath(backupBase(filePath));
+  try {
+    // never over another copy, even one that appeared since the name was chosen
+    fs.copyFileSync(filePath, backupPath, fs.constants.COPYFILE_EXCL);
+  } catch (err) {
+    if (err.code !== 'EEXIST') {
+      try {
+        fs.unlinkSync(backupPath); // half a copy is not a version
+      } catch {
+        /* never made */
+      }
+    }
+    throw cannotCopy(err);
+  }
   try {
     // never the copy just made, whatever its name says
     pruneBackups(path.basename(backupPath));
@@ -475,12 +463,23 @@ const isWithin = (p, dir) => p === dir || p.startsWith(dir.endsWith(path.sep) ? 
 // switch that says "this project" lands in the settings every project reads —
 // shown, with no warning, as a change to one project. Checking the file itself
 // for a link misses that: the link is a folder further up. So a project file
-// whose folder really lives in the global ~/.claude, or anywhere outside the
-// project, is refused. The file itself may still be a link (a settings file
-// kept in a dotfiles repo — see resolveWriteTarget), except to a file in the
-// global ~/.claude, which is the same trap one level down. That last part is
-// only for writing into the file: renaming one (switching it off) renames the
-// link itself and never touches what it points at.
+// whose folder really lives in the global ~/.claude is refused, always.
+//
+// Anywhere else depends on what the file is. A skill or subagent folder linked
+// in from somewhere else — a shared skills repo, a dotfiles checkout — is the
+// ordinary way to share one, the page says on its row that a switch or a save
+// changes the file where it really lives, and that is what happens: the same
+// trade a settings file linked into a dotfiles repo makes (resolveWriteTarget).
+// Every other project file — its settings, its instructions files — must also
+// really be inside the project: those are what "this project" means, and a
+// folder of a cloned repo linking out of it would let that repo pick the file.
+//
+// The file itself may still be a link (see resolveWriteTarget), except to a
+// file in the global ~/.claude, which is the same trap one level down. That
+// last part is only for writing into the file: renaming one (switching it
+// off) renames the link itself and never touches what it points at.
+const LINKABLE_DIRS = ['skills', 'agents'];
+
 function assertStaysInProject(filePath, projectPath, { rename = false } = {}) {
   const listed = path.resolve(filePath);
   const root = path.resolve(projectPath);
@@ -493,7 +492,8 @@ function assertStaysInProject(filePath, projectPath, { rename = false } = {}) {
   if (!(isWithin(dir, root) || isWithin(dir, realRoot)) || isWithin(dir, paths.GLOBAL_CLAUDE_DIR)) return;
   const realGlobal = realLocation(paths.GLOBAL_CLAUDE_DIR);
   const realDir = realLocation(dir);
-  if (isWithin(realDir, realGlobal) || !isWithin(realDir, realRoot)) {
+  const linkable = [root, realRoot].some((r) => LINKABLE_DIRS.some((d) => isWithin(dir, path.join(r, '.claude', d))));
+  if (isWithin(realDir, realGlobal) || (!linkable && !isWithin(realDir, realRoot))) {
     const where = isWithin(realDir, realGlobal) ? `your global ${paths.GLOBAL_CLAUDE_DIR} folder, which every project reads` : `${realDir}, outside this project`;
     throw new Refusal(
       `${listed} is this project's by its name, but the folder it is in is a link to ${where}. Writing it would change that instead, so it was not written. Change it there directly if that is what you mean.`
@@ -1116,7 +1116,12 @@ function backupSourcePath(real) {
 }
 
 function backupPrefix(real) {
-  return encodeSource(backupSourcePath(real)) + '.';
+  return backupBase(backupSourcePath(real)) + '.';
+}
+
+// The name this file's copies had before names changed (see legacyFlat).
+function legacyPrefix(real) {
+  return legacyFlat(backupSourcePath(real)) + '.';
 }
 
 // Matching on the name's start alone was not enough — every copy of
@@ -1129,32 +1134,40 @@ function isBackupOf(name, prefix) {
 }
 
 // The stamp in the name is an ISO time with its colons and dot replaced.
-function savedAtFromName(name, prefix) {
-  const stamp = name.slice(prefix.length, -'.bak'.length);
-  const iso = stamp.replace(/^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/, '$1T$2:$3:$4.$5Z');
-  const at = new Date(iso);
-  return Number.isNaN(at.getTime()) ? null : at.toISOString();
+function savedAtFromName(name) {
+  const parsed = BACKUP_NAME.exec(name);
+  const at = parsed ? stampToMs(parsed[2]) : null;
+  return at === null ? null : new Date(at).toISOString();
 }
 
 // An id is a file name inside the backup folder and nothing else, and only one
 // that belongs to this file: no separators, and it must carry this file's own
 // prefix, so no id can name a copy of some other file (or anything outside).
-function backupPathFor(real, id) {
+// A copy under the old kind of name may be another file's (see legacyFlat), so
+// it can be read to compare — `legacyOk` — but never put back.
+function backupPathFor(real, id, { legacyOk = false } = {}) {
   assertString(id, 'id');
-  const prefix = backupPrefix(real);
-  if (/[\\/\0]/.test(id) || !isBackupOf(id, prefix)) {
-    throw new Refusal('That is not a saved copy of this file.');
+  const mine = isBackupOf(id, backupPrefix(real));
+  const legacy = !mine && isBackupOf(id, legacyPrefix(real));
+  if (/[\\/\0]/.test(id) || !(mine || (legacy && legacyOk))) {
+    throw new Refusal(
+      legacy
+        ? 'That copy was taken before backup names changed, and may belong to another file with a similar path, so it can be compared but not put back. Copy any part of it you need by hand.'
+        : 'That is not a saved copy of this file.'
+    );
   }
   const full = path.join(BACKUP_DIR, id);
   if (!fs.existsSync(full)) throw new Refusal('That saved copy is not there any more — reload the list.', 409);
   return full;
 }
 
+const LEGACY_NOTE = 'Taken before backup names changed; it may belong to another file with a similar path, so it can be compared but not put back.';
+
 export function listBackups({ filePath, projectPath }) {
   const inv = buildInventory(projectPath);
   const real = assertViewable(filePath, projectPath, inv);
-  adoptLegacyCopies(backupSourcePath(real));
   const prefix = backupPrefix(real);
+  const oldPrefix = legacyPrefix(real);
   let names;
   let restorable = true;
   try {
@@ -1162,38 +1175,46 @@ export function listBackups({ filePath, projectPath }) {
   } catch {
     restorable = false; // a plugin's file, or one this project may not write
   }
+  const limits = { perFile: KEEP_PER_FILE, totalBytes: backupBudgetBytes() };
   try {
     names = fs.readdirSync(BACKUP_DIR);
   } catch {
     // nothing has been written yet
-    return { filePath: real, restorable, versions: [], limits: { perFile: KEEP_PER_FILE, totalBytes: backupBudgetBytes() } };
+    return { filePath: real, restorable, versions: [], limits };
   }
-  const versions = names
-    .filter((name) => isBackupOf(name, prefix))
-    .map((name) => {
-      let size = null;
-      let copiedAtMs = null;
-      try {
-        const st = fs.statSync(path.join(BACKUP_DIR, name));
-        size = st.size;
-        copiedAtMs = st.mtimeMs;
-      } catch {
-        /* it went away between listing and asking about it */
-      }
-      return {
-        id: name,
-        savedAt: savedAtFromName(name, prefix) || (copiedAtMs ? new Date(copiedAtMs).toISOString() : null),
-        savedAtMs: copiedAtMs,
-        size,
-      };
-    })
-    .sort((a, b) => String(b.id).localeCompare(String(a.id))); // newest first: the name carries the time
-  return { filePath: real, restorable, versions, limits: { perFile: KEEP_PER_FILE, totalBytes: backupBudgetBytes() } };
+  const versions = [];
+  for (const name of names) {
+    const legacy = !isBackupOf(name, prefix);
+    if (legacy && !isBackupOf(name, oldPrefix)) continue;
+    let size = null;
+    let copiedAtMs = null;
+    try {
+      const st = fs.statSync(path.join(BACKUP_DIR, name));
+      size = st.size;
+      copiedAtMs = st.mtimeMs;
+    } catch {
+      /* it went away between listing and asking about it */
+    }
+    versions.push({
+      id: name,
+      savedAt: savedAtFromName(name) || (copiedAtMs ? new Date(copiedAtMs).toISOString() : null),
+      savedAtMs: copiedAtMs,
+      size,
+      // per version: the file can be restorable while this copy of it is not
+      restorable: restorable && !legacy,
+      ...(legacy ? { legacy: true, note: LEGACY_NOTE } : {}),
+    });
+  }
+  // newest first, by the moment in the name: the two kinds of name sort apart
+  // as text, so comparing whole ids would put every old one after the new ones
+  const stamp = (v) => BACKUP_NAME.exec(v.id)[2];
+  versions.sort((a, b) => stamp(b).localeCompare(stamp(a)) || String(b.id).localeCompare(String(a.id)));
+  return { filePath: real, restorable, versions, limits };
 }
 
 export function readBackup({ filePath, projectPath, id }) {
   const real = assertViewable(filePath, projectPath);
-  return { filePath: real, id, content: fs.readFileSync(backupPathFor(real, id), 'utf8') };
+  return { filePath: real, id, content: fs.readFileSync(backupPathFor(real, id, { legacyOk: true }), 'utf8') };
 }
 
 // Putting an earlier version back is an ordinary save of that version's text:

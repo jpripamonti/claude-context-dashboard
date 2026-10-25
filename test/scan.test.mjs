@@ -320,12 +320,35 @@ if (process.platform !== 'win32' && fs.existsSync('/dev/zero')) {
     editablePathsFrom(homeInv).has(bashrc), JSON.stringify(importsOf(homeInv, path.join(HOME_REAL, 'CLAUDE.md'))));
   fs.unlinkSync(path.join(HOME_REAL, 'CLAUDE.md'));
 
-  // the global CLAUDE.md is held to the same rule: one outside both folders is read-only
-  w(path.join(GLOBAL, 'CLAUDE.md'), `# global\n@${outside}\n`);
+  // the user's own global CLAUDE.md chooses its imports itself: outside is editable
+  const chainB = path.join(SANDBOX, 'chain-b.md');
+  const chainA = path.join(SANDBOX, 'chain-a.md');
+  w(chainB, '# b\n');
+  w(chainA, `# a\n@${chainB}\n`);
+  const gOnly = path.join(SANDBOX, 'global-only.md');
+  w(gOnly, '# g\n');
+  w(path.join(GLOBAL, 'CLAUDE.md'), `# global\n@${gOnly}\n`);
   const globalInv = buildInventory(P);
-  check('a file the global CLAUDE.md pulls in from outside both folders is read-only too',
-    viewablePathsFrom(globalInv).has(outside) && !editablePathsFrom(globalInv).has(outside));
+  check('a file the global CLAUDE.md pulls in from outside both folders stays editable',
+    editablePathsFrom(globalInv).has(gOnly) && !scan.isOutsideImport(globalInv, gOnly));
+  w(path.join(GLOBAL, 'CLAUDE.md'), `# global\n@${chainA}\n`);
+  const gChain = buildInventory(P);
+  check('...and so does a chain global -> A -> B, both outside',
+    editablePathsFrom(gChain).has(chainA) && editablePathsFrom(gChain).has(chainB));
+  const P2 = project({ 'CLAUDE.md': `# p\n@${chainA}\n` });
+  w(path.join(GLOBAL, 'CLAUDE.md'), '# global\n');
+  const pChain = buildInventory(P2);
+  check('a chain project -> A -> B outside is read-only at both links',
+    viewablePathsFrom(pChain).has(chainB) && !editablePathsFrom(pChain).has(chainA) && !editablePathsFrom(pChain).has(chainB));
+  w(path.join(GLOBAL, 'CLAUDE.md'), `# global\n@${chainA}\n`);
+  const both = buildInventory(P2);
+  check('reachable from both global and project: the stricter wins (read-only)',
+    !editablePathsFrom(both).has(chainA) && !editablePathsFrom(both).has(chainB));
   fs.unlinkSync(path.join(GLOBAL, 'CLAUDE.md'));
+  fs.rmSync(P2, { recursive: true, force: true });
+  fs.rmSync(gOnly, { force: true });
+  fs.rmSync(chainA, { force: true });
+  fs.rmSync(chainB, { force: true });
 
   fs.unlinkSync(PL);
   fs.rmSync(P, { recursive: true, force: true });
@@ -372,6 +395,28 @@ if (process.platform !== 'win32' && fs.existsSync('/dev/zero')) {
   fs.unlinkSync(INSTALLED);
   fs.rmSync(P, { recursive: true, force: true });
   fs.rmSync(installDir, { recursive: true, force: true });
+}
+
+// A skill reached through a linked folder above it (not the skill folder
+// itself) still says it is a link — writes follow that link. A global skill is
+// not flagged just because ~/.claude as a whole is a link into dotfiles.
+{
+  const P = path.join(SANDBOX, 'proj-linked-skills');
+  const shared = path.join(SANDBOX, 'shared-skills');
+  w(path.join(shared, 'team', 'SKILL.md'), '---\ndescription: shared\n---\nbody\n');
+  fs.mkdirSync(path.join(P, '.claude'), { recursive: true });
+  fs.symlinkSync(shared, path.join(P, '.claude', 'skills'));
+  w(path.join(GLOBAL, 'skills', 'mine', 'SKILL.md'), '---\ndescription: mine\n---\nbody\n');
+  const inv = buildInventory(P);
+  const team = inv.skills.find((s) => s.name === 'team');
+  const mine = inv.skills.find((s) => s.name === 'mine');
+  check('a skill inside a linked skills folder is reported as living where the link leads',
+    team?.symlink === path.join(shared, 'team'), JSON.stringify(team));
+  check('a global skill under a linked ~/.claude is not flagged as a link',
+    mine && mine.symlink === null, JSON.stringify(mine));
+  fs.rmSync(P, { recursive: true, force: true });
+  fs.rmSync(shared, { recursive: true, force: true });
+  fs.rmSync(path.join(GLOBAL, 'skills', 'mine'), { recursive: true, force: true });
 }
 
 fs.rmSync(SANDBOX, { recursive: true, force: true });

@@ -17,6 +17,8 @@ function escapeHtml(s) {
 // straight away, so it is not left in the history, a bookmark or a copied link.
 const TOKEN_STORE_KEY = 'claude-context-dashboard.token';
 let dashboardToken = null;
+// Whether the key taken from the address last made it into sessionStorage.
+let tokenStored = false;
 
 function tokenFromAddress() {
   const hash = String(location.hash || '').replace(/^#/, '');
@@ -30,8 +32,10 @@ function takeToken() {
   const fromAddress = tokenFromAddress();
   if (fromAddress) {
     dashboardToken = fromAddress;
+    tokenStored = false;
     try {
       sessionStorage.setItem(TOKEN_STORE_KEY, fromAddress);
+      tokenStored = true;
     } catch {
       /* no storage: this tab works until it is reloaded */
     }
@@ -1174,10 +1178,10 @@ function renderVersions(diffHtml = '') {
         : ''
     }</div>
     ${versions.map((v) => `<div class="version-row">
-      <span class="version-when">${escapeHtml(formatWhen(v))}${v.size === null || v.size === undefined ? '' : ` · ${num(v.size)} bytes`}</span>
+      <span class="version-when">${escapeHtml(formatWhen(v))}${v.size === null || v.size === undefined ? '' : ` · ${num(v.size)} bytes`}${v.legacy && v.note ? ` <span class="muted">${escapeHtml(v.note)}</span>` : ''}</span>
       <span class="version-buttons">
         ${actionButton('See what changed', 'version-diff', { id: v.id })}
-        ${versionsRestorable ? actionButton('Put this one back', 'version-restore', { id: v.id }) : ''}
+        ${versionsRestorable && v.restorable !== false ? actionButton('Put this one back', 'version-restore', { id: v.id }) : ''}
       </span>
     </div>`).join('')}
     ${diffHtml}`;
@@ -1534,7 +1538,11 @@ document.addEventListener('keydown', (ev) => {
 // fragment, which loads nothing: take the new key and start over with it
 // (unsaved typing is asked about by the beforeunload warning above).
 window.addEventListener('hashchange', () => {
-  if (takeToken()) location.reload();
+  if (!takeToken()) return;
+  // A reload re-reads the key from storage, so it is only safe once it is
+  // there; otherwise the tab would lose it. Keep it in memory and start over.
+  if (tokenStored) location.reload();
+  else init();
 });
 
 takeToken();

@@ -31,6 +31,8 @@ claude-context --no-open                        # don't auto-open the browser
 
 It opens `http://localhost:4317`. You can switch projects from the page itself — by typing a path or picking one from Claude Code's own project history — or by opening `?path=/some/project`. On macOS, `macos/build-launcher.sh` builds a double-clickable launcher that asks for the folder first.
 
+Each launch makes a random key and prints the dashboard's address with it after a `#` (`http://localhost:4317/#token=…`). The API answers only requests carrying that key, so other programs and other users on the machine that can reach `localhost` cannot read or change your config through it. Open the whole printed address (with `--no-open`, copy it from the terminal); the page keeps the key for that tab and removes it from the address bar. The desktop launcher has no terminal to read it from, so the running dashboard also leaves the key in `~/.claude-context-dashboard/run/<port>.token`, readable only by you, and the launcher takes it from there.
+
 ## What it shows
 
 - **What loads before you type** — how much each thing adds at startup, in UTF-8 bytes and rough tokens, biggest first. Tool connections are not counted: measuring the tool list they send would mean connecting to them, which this never does.
@@ -93,7 +95,7 @@ exactly one computer.
 
 - The server listens on `127.0.0.1` only. Every API request needs a matching `Host`/`Origin`, and writes additionally need a JSON content type, so another site open in your browser can neither read your settings nor drive the switches.
 - It displays what is in the files, including any keys in an MCP server's `env` block. Keep it to your own machine.
-- Any local program that can reach the port can change config for any project — but a program running as you could already write those files directly.
+- The API needs this launch's key as well, so other users on the machine, and programs that can reach `localhost` but cannot read your home folder, cannot use it. A program running as you can read the key file — but it could already write your config files directly.
 
 ## Limitations
 

@@ -10,6 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import childProcess from 'node:child_process';
 
 const SANDBOX = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ccd-test-')));
 const HOME = path.join(SANDBOX, 'home');
@@ -77,6 +78,13 @@ const inventory = async (p = PROJECT) => (await get(`/api/inventory?path=${encod
 const parkedFile = path.join(HOME, '.claude-context-dashboard', 'parked.json');
 
 let failures = 0;
+function spawnSyncOk(cmd, args) {
+  try {
+    return childProcess.spawnSync(cmd, args, { stdio: 'ignore' }).status === 0;
+  } catch {
+    return false;
+  }
+}
 let checksRun = 0;
 const check = (label, cond, detail) => {
   checksRun++;
@@ -1451,6 +1459,21 @@ check('the dashboard\'s own host is accepted', (await rawStatus({ Host: `localho
   if (key) {
     const first = await meta(key);
     check('and that key opens its API', first.status === 200, JSON.stringify(first));
+    // the desktop launcher has no terminal to read the key from, so it is left
+    // in a file only this user can read
+    const keyFile = serverModule.tokenFilePath(cliPort, HOME);
+    const keyFileOk = () => {
+      try {
+        return fs.readFileSync(keyFile, 'utf8').trim() === key && (fs.statSync(keyFile).mode & 0o777) === 0o600;
+      } catch {
+        return false;
+      }
+    };
+    check('the command line leaves its key in a file only this user can read', keyFileOk(),
+      fs.existsSync(keyFile) ? (fs.statSync(keyFile).mode & 0o777).toString(8) : 'missing');
+    check('in a folder only this user can open', (fs.statSync(path.dirname(keyFile)).mode & 0o777) === 0o700);
+    check('with no temporary file left beside it', fs.readdirSync(path.dirname(keyFile)).filter((n) => n.endsWith('.tmp')).length === 0,
+      fs.readdirSync(path.dirname(keyFile)).join(','));
     const r = await fetch(`${cliBase}/api/restart`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dashboard-Token': key }, body: '{}' });
     check('a restart through the API is accepted', r.status === 200, r.status);
     let after = null;
@@ -1459,6 +1482,12 @@ check('the dashboard\'s own host is accepted', (await rawStatus({ Host: `localho
       return after.status === 200 && after.body.startedAt > first.body.startedAt;
     }, 20000);
     check('the replacement answers the same key the tab already holds', cameBack, JSON.stringify(after));
+    // the process that handed over is still alive, waiting; it must not have
+    // taken the file away from the replacement
+    check('and the key file survives the handover, still holding that key', keyFileOk(),
+      fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8') : 'missing');
+    // a stop during a restart reaches the replacement, which removes the file;
+    // checked below once both have gone
     const printedAgain = [...out.matchAll(new RegExp(urlRe, 'g'))].map((m) => m[1]);
     check('and prints the same address again', printedAgain.length === 2 && printedAgain[1] === key, JSON.stringify(printedAgain));
     check('while a different key is still refused', (await meta(serverModule.newToken())).status === 403);
@@ -1467,6 +1496,156 @@ check('the dashboard\'s own host is accepted', (await rawStatus({ Host: `localho
   await new Promise((r) => (cli.exitCode !== null || cli.signalCode ? r() : cli.on('exit', r)));
   check('stopping the command line stops the replacement too',
     await waitFor(async () => (await meta(key)).status === 0, 5000));
+  check('and the key file goes with them', !fs.existsSync(serverModule.tokenFilePath(cliPort, HOME)));
+}
+
+// A dashboard stopped with Ctrl+C (no restart in between) removes its key
+// file; and a file that holds some other key is left alone.
+{
+  const { spawn } = await import('node:child_process');
+  const p = await new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const cli = spawn(process.execPath, [new URL('../bin/cli.js', import.meta.url).pathname, '--path', PROJECT, '--port', String(p), '--no-open'], {
+    env: { ...process.env, [serverModule.TOKEN_ENV]: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  cli.stdout.on('data', (d) => { out += d; });
+  const keyFile = serverModule.tokenFilePath(p, HOME);
+  // The file can land before the printed address reaches this end of the
+  // pipe, so wait for both.
+  for (let i = 0; i < 100 && !(fs.existsSync(keyFile) && out.includes('#token=')); i++) await new Promise((r) => setTimeout(r, 100));
+  const written = fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8').trim() : null;
+  check('the key in the file is the key in the printed address', !!written && out.includes(`#token=${written}`), out);
+  cli.kill('SIGINT');
+  const code = await new Promise((r) => (cli.exitCode !== null ? r(cli.exitCode) : cli.on('exit', (c) => r(c))));
+  check('Ctrl+C removes the key file', !fs.existsSync(keyFile), String(code));
+  check('and ends with the code a shell gives Ctrl+C', code === 130, String(code));
+
+  const other = serverModule.newToken();
+  serverModule.writeTokenFile(p, other, HOME);
+  serverModule.removeTokenFile(p, serverModule.newToken(), HOME);
+  check('a key file holding some other key is not removed', fs.readFileSync(keyFile, 'utf8').trim() === other);
+  serverModule.removeTokenFile(p, other, HOME);
+  check('and one holding its own is', !fs.existsSync(keyFile));
+}
+
+// The macOS desktop launcher, bin/open-dashboard.sh, run with stand-ins for
+// `open` and `osascript` that only record what they were given. It hardcodes
+// port 4317 unless CLAUDE_DASHBOARD_PORT says otherwise.
+if (process.platform !== 'win32' && fs.existsSync('/bin/bash') && spawnSyncOk('curl', ['--version'])) {
+  const { spawn, spawnSync } = await import('node:child_process');
+  const freePort = () => new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const L = path.join(SANDBOX, 'launcher');
+  const fakeBin = path.join(L, 'bin');
+  const rec = path.join(L, 'rec');
+  const tmp = path.join(L, 'tmp');
+  for (const d of [fakeBin, rec, tmp]) fs.mkdirSync(d, { recursive: true });
+  for (const name of ['open', 'osascript']) {
+    fs.writeFileSync(path.join(fakeBin, name), `#!/bin/bash\nfor a in "$@"; do printf '%s\\n' "$a"; done >> "${rec}/${name}.args"\n`, { mode: 0o755 });
+  }
+  const recorded = (name) => { try { return fs.readFileSync(path.join(rec, `${name}.args`), 'utf8'); } catch { return ''; } };
+  const clearRecords = () => { for (const n of fs.readdirSync(rec)) fs.rmSync(path.join(rec, n)); };
+  const script = new URL('../bin/open-dashboard.sh', import.meta.url).pathname;
+  const target = path.join(SANDBOX, 'my proj');
+  fs.mkdirSync(target, { recursive: true });
+  const launch = (port) => spawnSync('/bin/bash', [script, target], {
+    env: {
+      HOME, TMPDIR: tmp, CLAUDE_DASHBOARD_PORT: String(port),
+      PATH: `${fakeBin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+    },
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  const expectedPage = (port, key) =>
+    `location.replace("http://localhost:${port}/?path=${encodeURIComponent(target)}#token=${key}")`;
+  const openedPage = () => {
+    const arg = recorded('open').trim();
+    try {
+      return { arg, mode: fs.statSync(arg).mode & 0o777, text: fs.readFileSync(arg, 'utf8') };
+    } catch {
+      return { arg };
+    }
+  };
+
+  // a dashboard already running, started from the command line
+  const p1 = await freePort();
+  const cli = spawn(process.execPath, [new URL('../bin/cli.js', import.meta.url).pathname, '--path', PROJECT, '--port', String(p1), '--no-open'], {
+    env: { ...process.env, [serverModule.TOKEN_ENV]: '' },
+    stdio: 'ignore',
+  });
+  const keyFile1 = serverModule.tokenFilePath(p1, HOME);
+  for (let i = 0; i < 100 && !fs.existsSync(keyFile1); i++) await new Promise((r) => setTimeout(r, 100));
+  const key1 = fs.existsSync(keyFile1) ? fs.readFileSync(keyFile1, 'utf8').trim() : '';
+  let r = launch(p1);
+  let page = openedPage();
+  check('the launcher reuses a running dashboard and opens it with that dashboard\'s key, keeping ?path=',
+    r.status === 0 && page.text?.includes(expectedPage(p1, key1)) && !recorded('osascript'),
+    `${r.status} ${r.stderr} ${JSON.stringify(page)} ${recorded('osascript')}`);
+  check('through a page only this user can read, so the key is not on `open`\'s command line',
+    page.mode === 0o600 && path.basename(page.arg) === 'open.html' && !page.arg.includes(key1) &&
+    (fs.statSync(path.dirname(page.arg)).mode & 0o777) === 0o700, JSON.stringify(page));
+
+  // a key file left behind that the running dashboard does not take
+  clearRecords();
+  const stale = serverModule.newToken();
+  serverModule.writeTokenFile(p1, stale, HOME);
+  r = launch(p1);
+  check('a key the running dashboard refuses is reported, not opened',
+    r.status === 1 && /did not accept the key/.test(recorded('osascript')) && /did not accept the key/.test(r.stderr) && !recorded('open'),
+    `${r.status} ${r.stderr} ${recorded('osascript')} ${recorded('open')}`);
+  cli.kill('SIGTERM');
+  await new Promise((res) => (cli.exitCode !== null ? res() : cli.on('exit', res)));
+  check('and that file, holding a key that is not the dashboard\'s own, outlives it', fs.existsSync(keyFile1) &&
+    fs.readFileSync(keyFile1, 'utf8').trim() === stale);
+
+  // nothing running, and a key file left by a dashboard that crashed: the
+  // launcher starts one itself and opens it with the new key
+  clearRecords();
+  r = launch(p1);
+  const key2 = fs.existsSync(keyFile1) ? fs.readFileSync(keyFile1, 'utf8').trim() : '';
+  page = openedPage();
+  check('with nothing running, the launcher starts a dashboard and opens it with the new key, not the stale one',
+    r.status === 0 && key2 && key2 !== stale && page.text?.includes(expectedPage(p1, key2)),
+    `${r.status} ${r.stderr} ${JSON.stringify(page)} ${recorded('osascript')}`);
+  const log = path.join(HOME, '.claude-context-dashboard', 'run', `server-${p1}.log`);
+  check('its output, which holds the key, goes to a log only this user can read',
+    fs.existsSync(log) && (fs.statSync(log).mode & 0o777) === 0o600, fs.existsSync(log) ? (fs.statSync(log).mode & 0o777).toString(8) : 'missing');
+  // stop the server the launcher started (it is not a child of this process)
+  spawnSync('pkill', ['-TERM', '-f', '--', `--port ${p1} --no-open`]);
+  let gone = false;
+  for (let i = 0; i < 50 && !gone; i++) {
+    await new Promise((res) => setTimeout(res, 100));
+    gone = !fs.existsSync(keyFile1);
+  }
+  check('and that dashboard, stopped, takes its key file with it', gone);
+
+  // a port nothing answers on, with no way to start one there: the launcher's
+  // server fails, and that is said
+  clearRecords();
+  // (in a process of its own: the launcher runs synchronously, so a socket
+  // held by this one would never be answered)
+  const p2 = await freePort();
+  const busy = spawn(process.execPath, ['-e',
+    `require('net').createServer((s) => s.destroy()).listen(${p2}, '127.0.0.1', () => console.log('up'))`], { stdio: ['ignore', 'pipe', 'ignore'] });
+  await new Promise((res) => busy.stdout.once('data', res));
+  r = launch(p2);
+  check('a port held by something that is not the dashboard is reported, not opened',
+    r.status === 1 && /did not start/.test(recorded('osascript')) && !recorded('open'), `${r.status} ${r.stderr} ${recorded('osascript')}`);
+  busy.kill();
+} else {
+  console.log('  (launcher checks skipped: needs bash and curl)');
 }
 
 // --- what the scan finds at all -------------------------------------------
@@ -1564,35 +1743,109 @@ check('and the row says where the link really points', linkedAgent?.symlink === 
     fs.rmSync(path.dirname(NL), { recursive: true, force: true });
   }
 
-  // Copies made under the old names are still on disk. They are taken over by
-  // a file only when it is the one file the old name can mean.
+  // Copies made under the old names are still on disk. Which file one came from
+  // cannot be known — guessing from what exists now handed a deleted file's
+  // history to the survivor for good — so they are never renamed: shown, marked,
+  // to a file whose old-style name is exactly theirs, to compare and not put back.
   {
     const legacy = (p2, stamp) => path.join(backupsDir, `${p2.replace(/[\\/]/g, '__')}.${stamp}.bak`);
     const SOLO = path.join(C, 'solo', 'CLAUDE.md');
     w(SOLO, '# solo now\n');
-    w(legacy(SOLO, '2020-01-01T00-00-00-000Z'), '# solo, as it was in 2020\n');
+    const soloOld = legacy(SOLO, '2020-01-01T00-00-00-000Z');
+    w(soloOld, '# solo, as it was in 2020\n');
+    w(legacy(SOLO + '.disabled', '2020-01-03T00-00-00-000Z'), 'the switched-off twin\n');
     const shared = legacy(A, '2020-01-02T00-00-00-000Z'); // A and B both flatten to this
     w(shared, 'whose is this?\n');
 
     const solo = await versionsOf(SOLO, C);
-    const id = solo.versions?.[0]?.id;
-    const kept = id ? (await get(`/api/file/backups?path=${encodeURIComponent(SOLO)}&project=${encodeURIComponent(C)}&id=${encodeURIComponent(id)}`)).body : {};
-    check('a copy kept under the old kind of name is still listed when only one file can own it',
+    const v = solo.versions?.[0];
+    const kept = v ? (await get(`/api/file/backups?path=${encodeURIComponent(SOLO)}&project=${encodeURIComponent(C)}&id=${encodeURIComponent(v.id)}`)).body : {};
+    check('a copy kept under the old kind of name is listed for the file whose old name is exactly its own, and can be read',
       solo.versions?.length === 1 && kept.content === '# solo, as it was in 2020\n', JSON.stringify(solo.versions));
-    check('and it now carries the new kind of name, so it reads back to that one file',
-      !!id && !id.startsWith('__') && !fs.existsSync(legacy(SOLO, '2020-01-01T00-00-00-000Z')), id);
+    check('marked as possibly another file\'s, and not to be put back',
+      v?.legacy === true && v?.restorable === false && /may belong to another file/.test(v?.note || '') && solo.restorable === true,
+      JSON.stringify(v));
+    check('and it is left under its old name: listing renames nothing',
+      fs.existsSync(soloOld) && v?.id === path.basename(soloOld), JSON.stringify(fs.readdirSync(backupsDir)));
+    res = await post('/api/file/restore', { filePath: SOLO, projectPath: C, id: v?.id, expectedMtimeMs: fs.statSync(SOLO).mtimeMs });
+    check('putting it back is refused, saying why, and the file is untouched',
+      res.status === 400 && /before backup names changed/.test(res.body.error || '') && fs.readFileSync(SOLO, 'utf8') === '# solo now\n',
+      `${res.status} ${JSON.stringify(res.body)}`);
+
+    // the case that made renaming wrong: the look-alike file is gone, and
+    // the one still there must not come to own its history
     const forA = await versionsOf(A, path.join(C, 'a'));
     const forB = await versionsOf(B, C);
-    check('an old name two files could own is offered to neither',
-      !forA.versions.some((v) => v.id === path.basename(shared)) && forB.versions.length === 0 &&
-      forA.versions.every((v) => !v.id.startsWith('__')),
-      JSON.stringify([forA.versions.map((v) => v.id), forB.versions.map((v) => v.id)]));
-    check('and it is left in the folder rather than thrown away', fs.existsSync(shared));
+    const oldOf = (list) => list.versions.filter((x) => x.legacy).map((x) => x.id);
+    check('an old name two files could own is shown to both, marked, and restorable for neither',
+      JSON.stringify(oldOf(forA)) === JSON.stringify([path.basename(shared)]) &&
+      JSON.stringify(oldOf(forB)) === JSON.stringify([path.basename(shared)]) &&
+      [...forA.versions, ...forB.versions].every((x) => x.legacy ? x.restorable === false : x.restorable === true) &&
+      forA.versions[0] && !forA.versions[0].legacy,
+      JSON.stringify([forA.versions, forB.versions]));
+    const bWas = fs.readFileSync(B, 'utf8');
+    fs.rmSync(path.dirname(B), { recursive: true, force: true });
+    await versionsOf(A, path.join(C, 'a'));
+    check('and with one of them deleted, it is still not handed to the other',
+      fs.existsSync(shared) && fs.readdirSync(backupsDir).filter((n) => n.includes('CLAUDE.md') && n.startsWith('%') && n.includes('2020-01-02')).length === 0,
+      JSON.stringify(fs.readdirSync(backupsDir)));
+    w(B, bWas);
     res = await post('/api/file/restore', {
       filePath: B, projectPath: C, id: path.basename(shared), expectedMtimeMs: fs.statSync(B).mtimeMs,
     });
     check('nor can it be put back into either of them by naming it',
       res.status === 400 && fs.readFileSync(B, 'utf8') === 'B original\n', `${res.status} ${JSON.stringify(res.body)}`);
+
+    // pruned as a file of its own: the old copies never cost a file its newest
+    for (let i = 0; i < 24; i++) w(legacy(SOLO, `2020-02-${String(i + 1).padStart(2, '0')}T00-00-00-000Z`), 'x'.repeat(5000));
+    process.env.CLAUDE_DASHBOARD_BACKUP_BUDGET = String(30000);
+    res = await saveTo(SOLO, '# solo, saved\n', C);
+    delete process.env.CLAUDE_DASHBOARD_BACKUP_BUDGET;
+    const after = (await versionsOf(SOLO, C)).versions;
+    const olds = after.filter((x) => x.legacy);
+    check('old-style copies are pruned as their own group, and the newest new-style copy survives the budget',
+      res.status === 200 && after[0] && !after[0].legacy && after[0].restorable === true &&
+      olds.length >= 1 && olds.length <= 20 && olds.some((x) => x.id.includes('2020-02-24')),
+      `${res.status} ${after.length} ${olds.length} ${JSON.stringify(after[0])}`);
+  }
+
+  // A path too deep to spell out in a copy's name: the spelled-out form is
+  // longer than the old one, so a save that used to work failed on the copy.
+  {
+    let deep = C;
+    while (Buffer.byteLength(path.join(deep, 'CLAUDE.md').replace(/[\\/]/g, '__')) + 29 < 245) deep = path.join(deep, 'abcd');
+    const DEEP = path.join(deep, 'CLAUDE.md');
+    const TWIN = path.join(deep, 'abcd', 'CLAUDE.md'); // the same tail, a different file
+    w(DEEP, '# deep\n');
+    w(TWIN, '# twin\n');
+    res = await saveTo(DEEP, '# deep, saved\n', deep);
+    const list = await versionsOf(DEEP, deep);
+    const id = list.versions?.[0]?.id || '';
+    check('a file too deep to spell out in a copy\'s name still saves, and lists the copy it kept',
+      res.status === 200 && list.versions?.length === 1 && Buffer.byteLength(id) <= 200 && id.endsWith(STAMP.exec(id)?.[0] || '!') &&
+      fs.readFileSync(path.join(backupsDir, id), 'utf8') === '# deep\n', `${res.status} ${JSON.stringify(res.body)} ${id}`);
+    res = await saveTo(TWIN, '# twin, saved\n', deep);
+    const twin = await versionsOf(TWIN, deep);
+    check('and a different deep file gets copies of its own, not the first one\'s',
+      res.status === 200 && twin.versions?.length === 1 && twin.versions[0].id !== id &&
+      (await versionsOf(DEEP, deep)).versions.length === 1, JSON.stringify([id, twin.versions]));
+    res = await post('/api/file/restore', { filePath: TWIN, projectPath: deep, id, expectedMtimeMs: fs.statSync(TWIN).mtimeMs });
+    check('nor can the first one\'s copy be put back into it',
+      res.status === 400 && fs.readFileSync(TWIN, 'utf8') === '# twin, saved\n', `${res.status} ${JSON.stringify(res.body)}`);
+    fs.rmSync(path.join(C, 'abcd'), { recursive: true, force: true });
+  }
+
+  // A copy that cannot be made fails the write before the file is touched.
+  {
+    const realCopy = fs.copyFileSync;
+    fs.copyFileSync = () => { throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }); };
+    const was = fs.readFileSync(projectMd, 'utf8');
+    res = await saveTo(projectMd, '# not without a copy\n');
+    fs.copyFileSync = realCopy;
+    check('a write whose copy cannot be taken is refused with the reason, and the file is untouched',
+      res.status >= 400 && /Could not keep a copy/.test(res.body.error || '') && /ENOSPC/.test(res.body.error || '') &&
+      fs.readFileSync(projectMd, 'utf8') === was && !fs.readdirSync(PROJECT).some((n) => n.includes('.tmp-')),
+      `${res.status} ${JSON.stringify(res.body)}`);
   }
 
   // A version goes back byte for byte: reading it as text first turned a file
@@ -1752,6 +2005,35 @@ check('and the row says where the link really points', linkedAgent?.symlink === 
       fs.readFileSync(path.join(OUT, 'CLAUDE.md'), 'utf8') === '# lives outside\n', `${res.status} ${JSON.stringify(res.body)}`);
     fs.unlinkSync(P4_ALIAS);
     fs.rmSync(P4, { recursive: true, force: true });
+
+    // A skill or subagent folder linked in from elsewhere is how one is shared:
+    // the row says a switch or a save changes it where it really lives, and so
+    // it must — refusing made both buttons fail. Into ~/.claude stays refused.
+    const P7 = path.join(SANDBOX, 'linked-skill-proj');
+    const SHARED = path.join(SANDBOX, 'shared-skills', 'roam');
+    w(path.join(P7, 'CLAUDE.md'), '# p7\n');
+    w(path.join(SHARED, 'SKILL.md'), '---\nname: roam\ndescription: shared\n---\nbody\n');
+    fs.mkdirSync(path.join(P7, '.claude', 'skills'), { recursive: true });
+    fs.symlinkSync(SHARED, path.join(P7, '.claude', 'skills', 'roam'));
+    fs.symlinkSync(path.join(HOME, '.claude', 'skills', 'tidy'), path.join(P7, '.claude', 'skills', 'tidy'));
+    const p7Skills = (await inventory(P7)).skills;
+    const roam = p7Skills.find((x) => x.name === 'roam' && x.scope === 'project');
+    const shownRoam = await readFile(roam?.path || '', P7);
+    res = await post('/api/file/save', { filePath: roam?.path, projectPath: P7, content: '---\nname: roam\ndescription: edited\n---\n', expectedMtimeMs: shownRoam.mtimeMs });
+    check('a project skill folder linked in from outside the project opens writable and saves where it really lives',
+      !!roam?.symlink && shownRoam.writable === true && res.status === 200 && /edited/.test(fs.readFileSync(path.join(SHARED, 'SKILL.md'), 'utf8')),
+      `${res.status} ${JSON.stringify(res.body)} ${JSON.stringify(shownRoam).slice(0, 200)}`);
+    res = await post('/api/toggle/file', { filePath: roam?.path, projectPath: P7, enabled: false });
+    check('and switching it off renames the file where it really lives',
+      res.status === 200 && fs.existsSync(path.join(SHARED, 'SKILL.md.disabled')) && !fs.existsSync(path.join(SHARED, 'SKILL.md')),
+      `${res.status} ${JSON.stringify(res.body)}`);
+    const tidyRow = p7Skills.find((x) => x.name === 'tidy' && x.scope === 'project');
+    res = await post('/api/toggle/file', { filePath: tidyRow?.path, projectPath: P7, enabled: false });
+    check('but one linked into the global .claude folder is still refused, and the global skill stays on',
+      !!tidyRow && res.status === 400 && /every project reads/.test(res.body.error || '') && fs.existsSync(globalSkill),
+      `${res.status} ${JSON.stringify(res.body)}`);
+    fs.rmSync(P7, { recursive: true, force: true });
+    fs.rmSync(path.dirname(SHARED), { recursive: true, force: true });
   }
 
   // Answers say what kind of "no" they are.

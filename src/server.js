@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildInventory, listKnownProjects } from './scan.js';
@@ -82,6 +83,40 @@ export function takeTokenFromEnv(env = process.env) {
   const t = env[TOKEN_ENV];
   delete env[TOKEN_ENV];
   return typeof t === 'string' && TOKEN_SHAPE.test(t) ? t : null;
+}
+
+// Where a running dashboard leaves its key for bin/open-dashboard.sh, the
+// desktop launcher, which starts the server with no terminal to print to (or
+// reuses one already running) and so has no other way to learn it. One file
+// per port, in a folder only this user can open, readable only by this user:
+// it keeps the key from other users, not from other programs running as you.
+export function tokenFilePath(port, home = os.homedir()) {
+  return path.join(home, '.claude-context-dashboard', 'run', `${port}.token`);
+}
+
+// Written whole or not at all (temp file + rename), so the launcher never reads
+// half a key. A restart's replacement writes the same key again over it.
+export function writeTokenFile(port, token, home = os.homedir()) {
+  const file = tokenFilePath(port, home);
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  const tmp = path.join(dir, `.${port}.token.${process.pid}.tmp`);
+  fs.rmSync(tmp, { force: true });
+  fs.writeFileSync(tmp, `${token}\n`, { mode: 0o600, flag: 'wx' });
+  fs.renameSync(tmp, file);
+  return file;
+}
+
+// Removes the file only while it still holds this key: a dashboard started on
+// the same port since then has written its own, and that one stays.
+export function removeTokenFile(port, token, home = os.homedir()) {
+  const file = tokenFilePath(port, home);
+  try {
+    if (fs.readFileSync(file, 'utf8').trim() === token) fs.rmSync(file, { force: true });
+  } catch {
+    /* already gone */
+  }
 }
 
 // Compared as hashes so that neither the length nor any prefix of the key can
@@ -217,8 +252,15 @@ function restartSelf(server, { token } = {}) {
     });
     child.on('exit', (code, signal) => process.exit(signal ? 1 : code ?? 0));
     // this process is now only a waiter, so a stop aimed at it has to reach
-    // the process actually serving the dashboard
-    for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child.kill(signal));
+    // the process actually serving the dashboard — and not stop this one first:
+    // the command line's own handlers (which exit at once) are dropped, so the
+    // terminal gets its prompt back only once the replacement has gone too.
+    // This process leaves when the replacement does, so the key file it
+    // removes on the way out (bin/cli.js) is never one still in use.
+    for (const signal of ['SIGINT', 'SIGTERM']) {
+      process.removeAllListeners(signal);
+      process.on(signal, () => child.kill(signal));
+    }
   };
   server.close(replace);
   // close() only stops new connections. The browser holds this one open, and

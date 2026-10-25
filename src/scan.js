@@ -168,6 +168,31 @@ function statSafe(p) {
   }
 }
 
+// Where a skill or agent really lives when any part of its path is a link —
+// the entry itself, or a linked `.claude` or `skills` folder above it. Writes
+// follow the link, so the row has to say so either way. The project root and
+// home are already realpath-resolved, so an unlinked project path reads back
+// as itself; the global ~/.claude is often a link into a dotfiles repo as a
+// whole, which is not news about any one skill, so under it only links below
+// that folder count.
+function linkedTo(p) {
+  let real;
+  try {
+    real = fs.realpathSync(p);
+  } catch {
+    return null;
+  }
+  let expected = p;
+  if (p.startsWith(GLOBAL_CLAUDE_DIR + path.sep)) {
+    try {
+      expected = path.join(fs.realpathSync(GLOBAL_CLAUDE_DIR), path.relative(GLOBAL_CLAUDE_DIR, p));
+    } catch {
+      // ~/.claude unreadable as a whole: fall back to the plain comparison
+    }
+  }
+  return real !== expected ? real : null;
+}
+
 function resolveIfSymlink(p) {
   const st = statSafe(p);
   if (st && st.isSymbolicLink()) {
@@ -490,7 +515,15 @@ function scanClaudeMd(canonicalProjectPath) {
   // otherwise whoever wrote that CLAUDE.md chooses which of your files this
   // dashboard offers to overwrite. Judged on where the file really is, links
   // followed, so a link inside the project cannot carry the edit out of it.
+  //
+  // The rule is about a cloned repo choosing the target, so it applies to
+  // imports reached from a file in the project or one of its parent folders
+  // (a parent folder could itself be a cloned repo that contains the project).
+  // Imports reached from the user's own global CLAUDE.md, chains included
+  // (every row of its importedFiles is reached from it), are the user's own
+  // choice and stay editable wherever they point.
   for (const f of [...files, ...nested]) {
+    if (f.label === 'global') continue;
     for (const i of f.importedFiles) {
       if (!i.missing && !i.error && !i.alreadyPulledIn && !isInsideEditableRoots(i.path, canonicalProjectPath)) {
         i.outsideProject = true;
@@ -870,7 +903,7 @@ function scanEntries(dirPath, fileName, scopeLabel, errors) {
       disabled: target.endsWith('.disabled'),
       description: fm.description || null,
       startupBytes: descriptionWeight(entry.name, fm.description),
-      symlink: resolveIfSymlink(entryPath) !== entryPath ? resolveIfSymlink(entryPath) : null,
+      symlink: linkedTo(entryPath),
     });
   }
   return out;
@@ -906,7 +939,7 @@ function scanFlatAgents(dirPath, scopeLabel, errors) {
       disabled: entry.name.endsWith('.disabled'),
       description: fm.description || null,
       startupBytes: descriptionWeight(entry.name, fm.description),
-      symlink: resolveIfSymlink(full) !== full ? resolveIfSymlink(full) : null,
+      symlink: linkedTo(full),
     });
   }
   return out;
@@ -1424,11 +1457,17 @@ export function editablePathsFrom(inv) {
   // so it can be changed here too — but only under the exact name the "@" line
   // gives it, and with no ".disabled" twin: switching one off would not park
   // it, it would leave the "@" line pointing at nothing.
+  // A path reachable from both the global file and a project file is judged by
+  // the stricter: any row marked outsideProject keeps it read-only.
+  const blocked = new Set();
+  for (const f of [...inv.claudeMd.files, ...inv.claudeMd.nested]) {
+    for (const i of f.importedFiles) if (i.outsideProject) blocked.add(i.path);
+  }
   for (const f of [...inv.claudeMd.files, ...inv.claudeMd.nested]) {
     // ...and only when it lives in the project or the global .claude folder
     // (see outsideProject in scanClaudeMd): it can still be read, not changed.
     for (const i of f.importedFiles) {
-      if (!i.missing && !i.error && !i.alreadyPulledIn && !i.outsideProject) set.add(i.path);
+      if (!i.missing && !i.error && !i.alreadyPulledIn && !i.outsideProject && !blocked.has(i.path)) set.add(i.path);
     }
   }
   for (const l of inv.settingsLayers) add(l.path);

@@ -17,17 +17,3 @@ what they left, or what the fixes themselves introduced.
       committed `.claude/settings.json`, not `settings.local.json`, so a
       teammate sees the change too. Needs a check against a real Claude Code
       session.
-
-## Backups
-
-- [ ] Adopting legacy backups: old `__`-named copies are renamed to the new
-      form only when exactly one file on disk could own the name. If a
-      colliding file was deleted, the survivor is the only candidate and
-      claims all of the old copies, including ones that were really the
-      deleted file's. The versions list can then offer text from a file that
-      is not this one.
-- [ ] Very long paths can exceed the 255-character filename limit for a
-      backup name: the whole path is written into the name, and `%XX`
-      encoding makes it up to three times longer. The write then fails at the
-      copy step, which is safe (nothing is written without a backup) but
-      leaves that file impossible to edit from here.

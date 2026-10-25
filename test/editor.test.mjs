@@ -182,10 +182,11 @@ const alerted = [];
 // Opened the way the terminal's address opens it — the key in the fragment —
 // and on a project already in the address, which taking the key out must keep.
 const startSearch = `?path=${encodeURIComponent(PROJECT)}`;
+let lastLocation = null;
 const pageGlobals = ({ hash, search, sessionStorage }) => ({
   document,
   window: windowStub,
-  location: { pathname: '/', search, hash, reload: () => { reloads++; } },
+  location: (lastLocation = { pathname: '/', search, hash, reload: () => { reloads++; } }),
   history: { replaceState: (state, title, url) => addresses.push(String(url)) },
   sessionStorage,
   fetch: fetchShim,
@@ -462,6 +463,21 @@ check('and the editor shows what is now in the file',
   editorText.value === '# version A\nline one\nline two\n', JSON.stringify(editorText.value));
 check('what it replaced was kept as a version too',
   (await (await fetch(`${BASE}/api/file/backups?path=${encodeURIComponent(projectMd)}&project=${encodeURIComponent(PROJECT)}`, { headers: { Origin: BASE, ...T } })).json()).versions.length > list.versions.length);
+
+// A copy taken under the old naming (/ written as __) may be another file's,
+// so it is listed to compare but offers no way to put it back.
+{
+  const legacyName = projectMd.replace(/[\\/]/g, '__') + '.2020-01-01T00-00-00-000Z.bak';
+  w(path.join(HOME, '.claude-context-dashboard', 'backups', legacyName), '# from the old naming\n');
+  await context.refreshVersions();
+  if (el('editor-history').hidden) await fireClick(el('editor-versions'));
+  const rows = el('editor-history').innerHTML;
+  const legacyButtons = buttonsIn(rows).filter((b) => b.dataset.id === legacyName);
+  check('an old-style copy is listed, marked as possibly another file\'s',
+    legacyButtons.some((b) => b.dataset.action === 'version-diff') && /may belong to another file/.test(rows), rows.slice(-600));
+  check('and it has no button to put it back',
+    !legacyButtons.some((b) => b.dataset.action === 'version-restore'), JSON.stringify(legacyButtons.map((b) => b.dataset)));
+}
 
 // --- a file that can be read but not written --------------------------
 const pluginSkill = path.join(HOME, '.claude', 'plugins', 'cache', 'demo', 'skills', 'thing', 'SKILL.md');
@@ -805,6 +821,23 @@ check('storage that refuses does not stop the key in the address from working',
 await bootAgain({ hash: `#token=${TOKEN}`, search: '', sessionStorage: makeStorage({ 'claude-context-dashboard.token': 'stale-key-from-an-earlier-launch' }) });
 check('a key in the address wins over an older one kept for the tab',
   requests.length >= 1 && requests.every((r) => r.headers['X-Dashboard-Token'] === TOKEN), JSON.stringify(requests.map((r) => r.headers)));
+
+// a new key arrives in the address while storage refuses it: no reload (the
+// reloaded tab would have no key at all), the page carries on with the key it holds
+{
+  await bootAgain({ hash: `#token=${TOKEN}`, search: '', sessionStorage: broken });
+  const fresh = 'second-launch-key';
+  const reloadsBefore = reloads;
+  const handler = windowHandlers.hashchange[windowHandlers.hashchange.length - 1];
+  lastLocation.hash = `#token=${fresh}`;
+  requests.length = 0;
+  handler();
+  for (let i = 0; i < 50 && !requests.length; i++) await settle();
+  await settle();
+  check('a new key with storage refusing does not reload the tab', reloads === reloadsBefore, `${reloads} vs ${reloadsBefore}`);
+  check('and the next request carries the new key',
+    requests.length >= 1 && requests.every((r) => r.headers['X-Dashboard-Token'] === fresh), JSON.stringify(requests.map((r) => r.headers)));
+}
 
 server.close();
 if (failures) {
