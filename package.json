@@ -1,6 +1,6 @@
 {
   "name": "claude-context-dashboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local dashboard showing everything Claude Code would load for a project: instructions files, settings, plugins, MCP servers, skills, and subagents.",
   "type": "module",
   "bin": {
@@ -13,6 +13,7 @@
     "public",
     "README.md",
     "LICENSE",
+    "CHANGELOG.md",
     "docs/reference.md",
     "docs/schema-assumptions.md"
   ],
