@@ -1,7 +1,11 @@
 name: test
 
+# Linux only, on the lowest Node the package declares (18) and the newest (22). A macOS runner bills ten
+# minutes for each minute it runs and the project has no dependencies, so a macOS job would cost most of the
+# account's Actions quota for little. A push to a branch with a pull request open runs once, not twice.
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -9,9 +13,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        node: [18, 20, 22]
-    runs-on: ${{ matrix.os }}
+        node: [18, 22]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
